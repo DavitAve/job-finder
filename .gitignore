@@ -1,0 +1,61 @@
+# Local secrets and environment configuration
+.env
+.env.*
+!.env.example
+
+# Python environments, caches and build artifacts
+.venv/
+backend/.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.pytest-tmp*/
+.coverage
+htmlcov/
+build/
+
+# Frontend dependencies and generated files
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+node_modules/
+dist/
+coverage/
+playwright-report/
+test-results/
+
+# Private company datasets and uploaded source files
+backend/data/*
+!backend/data/companies.example.json
+*.xlsx
+*.xls
+*.csv
+
+# Crawl results, history, discovered URLs and runtime locks
+backend/output/
+output*/
+backend/output/*.lock
+backend/data/resumes/*.lock
+*.tmp
+
+# Uploaded resumes and possible local databases
+*.pdf
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs and local launcher state
+.logs/
+*.log
+
+# Editors and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local Codex/agent configuration
+.agents/
+.codex/

@@ -1,0 +1,15 @@
+[
+  {
+    "id": "example-company",
+    "name": "Example Company",
+    "website_url": "https://example.com",
+    "careers_url": null,
+    "enabled": false,
+    "adapter": "auto",
+    "adapter_options": {},
+    "metadata": {
+      "Тип": "Example",
+      "Страна / основные локации": "Armenia"
+    }
+  }
+]
