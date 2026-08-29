@@ -53,6 +53,7 @@ class HttpFetcher:
         *,
         per_domain: int = 2,
         timeout_seconds: float = 15.0,
+        domain_wait_seconds: float = 5.0,
         retries: int = 2,
         min_domain_delay_seconds: float = 0.25,
         respect_robots: bool = True,
@@ -62,6 +63,7 @@ class HttpFetcher:
         self.client = client
         self.per_domain = per_domain
         self.timeout_seconds = timeout_seconds
+        self.domain_wait_seconds = domain_wait_seconds
         self.retries = retries
         self.min_domain_delay_seconds = min_domain_delay_seconds
         self.respect_robots = respect_robots
@@ -100,7 +102,15 @@ class HttpFetcher:
         merged_headers = {"User-Agent": self.user_agent, "Accept": "text/html,application/json"}
         if headers:
             merged_headers.update(headers)
-        async with semaphore:
+        try:
+            await asyncio.wait_for(
+                semaphore.acquire(), timeout=self.domain_wait_seconds
+            )
+        except TimeoutError as exc:
+            raise FetchError(
+                f"Domain request pool busy for more than {self.domain_wait_seconds:g}s: {domain}"
+            ) from exc
+        try:
             await self._wait_for_domain(domain)
             return await self.client.request(
                 method,
@@ -110,6 +120,8 @@ class HttpFetcher:
                 timeout=self.timeout_seconds,
                 follow_redirects=True,
             )
+        finally:
+            semaphore.release()
 
     async def _robots_for(self, url: str) -> RobotFileParser | None:
         parts = urlsplit(url)
@@ -195,6 +207,26 @@ class HttpFetcher:
                 raise
             except (httpx.HTTPError, asyncio.TimeoutError) as exc:
                 last_error = exc
+                if isinstance(exc, httpx.HTTPStatusError) and 400 <= exc.response.status_code < 500:
+                    break
+                if isinstance(exc, httpx.TooManyRedirects):
+                    break
+                detail = str(exc).casefold()
+                if any(
+                    marker in detail
+                    for marker in (
+                        "certificate verify failed",
+                        "getaddrinfo failed",
+                        "name or service not known",
+                        "nodename nor servname",
+                    )
+                ):
+                    break
+                if isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError)):
+                    # One retry is enough for a transient network timeout. Three
+                    # 15-second attempts leave no budget for fallback discovery.
+                    if attempt >= min(self.retries, 1):
+                        break
                 if attempt < self.retries:
                     await asyncio.sleep(self._retry_delay(last_response, attempt))
                     continue

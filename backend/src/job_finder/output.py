@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from job_finder.models import CrawlReport
+from job_finder.models import CompanyStatus, CrawlReport
 
 
 def _write_json_atomic(path: Path, payload: dict) -> None:
@@ -63,7 +63,57 @@ def write_report(report: CrawlReport, output_directory: Path) -> tuple[Path, Pat
             # Discovery suggestions are an audit aid and must not invalidate a
             # successfully committed crawl report.
             pass
+    try:
+        _update_company_history(report, output_directory)
+    except (OSError, ValueError, json.JSONDecodeError):
+        # Compact diagnostics history is supplementary and must not turn a
+        # committed crawl into a failed run.
+        pass
     return latest, snapshot
+
+
+def _update_company_history(
+    report: CrawlReport, output_directory: Path, *, keep: int = 5
+) -> None:
+    path = output_directory / "company-history.json"
+    history: dict[str, list[dict[str, Any]]] = {}
+    if path.exists():
+        payload = _read_json(path)
+        for company_id, entries in payload.items():
+            if isinstance(company_id, str) and isinstance(entries, list):
+                history[company_id] = [entry for entry in entries if isinstance(entry, dict)]
+    processed_ids = set(report.processed_company_ids)
+    if not processed_ids and report.scope == "full":
+        processed_ids = {result.company_id for result in report.companies}
+    for result in report.companies:
+        if result.company_id not in processed_ids or result.status == CompanyStatus.SKIPPED:
+            continue
+        entry = {
+            "run_id": report.run_id,
+            "checked_at": (result.last_crawled_at or report.finished_at).isoformat(),
+            "status": result.status.value,
+            "careers_url": result.resolved_careers_url or result.careers_url,
+            "adapter": result.adapter,
+            "jobs_found": result.matching_jobs,
+            "error": result.error,
+            "duration_ms": result.duration_ms,
+        }
+        existing = [item for item in history.get(result.company_id, []) if item.get("run_id") != report.run_id]
+        history[result.company_id] = [entry, *existing][:keep]
+    _write_json_atomic(path, history)
+
+
+def read_company_history(
+    output_directory: Path, company_id: str, *, limit: int = 5
+) -> list[dict[str, Any]]:
+    path = output_directory / "company-history.json"
+    if not path.exists():
+        return []
+    payload = _read_json(path)
+    entries = payload.get(company_id, [])
+    if not isinstance(entries, list):
+        return []
+    return [entry for entry in entries if isinstance(entry, dict)][:limit]
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -73,11 +123,22 @@ def _read_json(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _validate_report(payload: dict[str, Any]) -> CrawlReport:
+    """Load old snapshots while preserving explicit nulls for skipped companies."""
+    report = CrawlReport.model_validate(payload)
+    raw_companies = payload.get("companies")
+    if isinstance(raw_companies, list):
+        for raw, result in zip(raw_companies, report.companies, strict=False):
+            if isinstance(raw, dict) and "last_crawled_at" not in raw:
+                result.last_crawled_at = report.finished_at
+    return report
+
+
 def read_latest(output_directory: Path) -> CrawlReport | None:
     path = output_directory / "latest.json"
     if not path.exists():
         return None
-    return CrawlReport.model_validate(_read_json(path))
+    return _validate_report(_read_json(path))
 
 
 def read_run(output_directory: Path, run_id: str) -> CrawlReport | None:
@@ -86,7 +147,7 @@ def read_run(output_directory: Path, run_id: str) -> CrawlReport | None:
     path = output_directory / "runs" / f"{run_id}.json"
     if not path.exists():
         return None
-    return CrawlReport.model_validate(_read_json(path))
+    return _validate_report(_read_json(path))
 
 
 def list_history(output_directory: Path, limit: int = 3) -> list[CrawlReport]:
@@ -95,7 +156,7 @@ def list_history(output_directory: Path, limit: int = 3) -> list[CrawlReport]:
     reports: list[CrawlReport] = []
     for path in (output_directory / "runs").glob("*.json"):
         try:
-            report = CrawlReport.model_validate(_read_json(path))
+            report = _validate_report(_read_json(path))
         except (OSError, ValueError, json.JSONDecodeError):
             continue
         if report.run_id != latest_id:
@@ -108,7 +169,7 @@ def _prune_snapshots(runs_directory: Path, keep: int) -> None:
     valid: list[tuple[CrawlReport, Path]] = []
     for path in runs_directory.glob("*.json"):
         try:
-            valid.append((CrawlReport.model_validate(_read_json(path)), path))
+            valid.append((_validate_report(_read_json(path)), path))
         except (OSError, ValueError, json.JSONDecodeError):
             continue
     valid.sort(key=lambda item: item[0].finished_at, reverse=True)

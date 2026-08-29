@@ -30,6 +30,16 @@
 button, select { cursor: pointer; }
 button:disabled { cursor: not-allowed; }
 
+html, body, #root {
+  width: 100%;
+  min-width: 0;
+  min-height: 100%;
+  overflow-x: hidden;
+}
+
+body { margin: 0; }
+img, svg { max-width: 100%; }
+
 .pager-button {
   border: 1px solid var(--app-border);
   border-radius: 0.5rem;

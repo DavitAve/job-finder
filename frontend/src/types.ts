@@ -1,5 +1,12 @@
 export type WorkFormat = "remote" | "hybrid" | "onsite" | "unknown";
 
+export interface AuthUser {
+  id: string;
+  email: string;
+  display_name: string;
+  created_at: string;
+}
+
 export interface Job {
   job_id: string;
   company: string;
@@ -25,8 +32,10 @@ export interface CrawlStats {
   total_companies: number;
   success: number;
   no_jobs: number;
+  unsupported?: number;
   blocked: number;
   failed: number;
+  unverified?: number;
   skipped: number;
   jobs_found: number;
   duplicates_removed: number;
@@ -35,15 +44,16 @@ export interface CrawlStats {
 export interface CrawlError {
   company_id: string;
   company: string;
-  status: "blocked" | "failed";
+  status: "blocked" | "failed" | "unsupported" | "unverified";
   message: string;
 }
 
-export type CompanyStatus = "success" | "no_jobs" | "blocked" | "failed" | "skipped";
+export type CompanyStatus = "success" | "no_jobs" | "unsupported" | "blocked" | "failed" | "unverified" | "skipped";
 
 export interface CompanyCrawlResult {
   company_id: string;
   company: string;
+  website_url?: string | null;
   careers_url?: string | null;
   resolved_careers_url?: string | null;
   careers_url_discovered?: boolean;
@@ -52,6 +62,7 @@ export interface CompanyCrawlResult {
   candidates_found: number;
   matching_jobs: number;
   duration_ms: number;
+  last_crawled_at?: string | null;
   error: string | null;
   warnings: string[];
 }
@@ -69,9 +80,13 @@ export interface CompanySummary {
   locations: string | null;
   remote_compatibility: string | null;
   frontend_compatibility: string | null;
+  adapter: "auto" | "html" | "browser";
+  last_adapter: string | null;
   enabled: boolean;
   crawl_status: CompanyStatus | null;
   jobs_found: number;
+  last_crawled_at?: string | null;
+  refresh_due?: boolean;
 }
 
 export interface CompanyImportResult {
@@ -97,6 +112,31 @@ export interface CompanyMutationResult {
   changed: number;
   total: number;
   backup_file: string;
+}
+
+export interface CompanyDiagnostics {
+  company_id: string;
+  company: string;
+  configured_adapter: string;
+  latest_result: CompanyCrawlResult | null;
+  request_url: string;
+  response_url: string | null;
+  response_status: number | null;
+  response_headers: Record<string, string>;
+  raw_preview: string | null;
+  raw_truncated: boolean;
+  fetch_error: string | null;
+}
+
+export interface CompanyHistoryItem {
+  run_id: string;
+  checked_at: string;
+  status: CompanyStatus;
+  careers_url: string | null;
+  adapter: string | null;
+  jobs_found: number;
+  error: string | null;
+  duration_ms: number;
 }
 
 export interface JobChanges {
@@ -136,7 +176,7 @@ export interface ResumeMatches {
 
 export interface CrawlReport {
   schema_version: string;
-  scope?: "full" | "new" | "selected";
+  scope?: "full" | "new" | "stale" | "selected";
   processed_company_ids?: string[];
   run_id: string;
   started_at: string;
@@ -154,7 +194,7 @@ export interface RunSummary {
   stats: CrawlStats;
 }
 
-export type RunStatus = "idle" | "queued" | "running" | "completed" | "failed";
+export type RunStatus = "idle" | "queued" | "running" | "completed" | "failed" | "cancelled";
 
 export interface ActiveRun {
   run_id: string | null;
@@ -164,12 +204,15 @@ export interface ActiveRun {
   processed: number;
   total: number;
   jobs_found: number;
-  scope?: "full" | "new" | "selected";
+  scope?: "full" | "new" | "stale" | "selected";
   success?: number;
   no_jobs?: number;
+  unsupported?: number;
   blocked?: number;
   failed?: number;
+  unverified?: number;
   skipped?: number;
   last_company?: string | null;
   error?: string | null;
+  message?: string | null;
 }

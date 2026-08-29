@@ -1,6 +1,6 @@
 import type { CrawlStats } from "../types";
 
-export type ReportTab = "jobs" | "blocked" | "failed";
+export type ReportTab = "jobs" | "no_jobs" | "unsupported" | "unverified" | "blocked" | "failed";
 
 interface Props {
   stats: CrawlStats;
@@ -10,13 +10,16 @@ interface Props {
 
 export function StatCards({ stats, activeTab, onTabChange }: Props) {
   const cards: ReadonlyArray<{ label: string; value: number; tab?: ReportTab }> = [
-    { label: "Обработано", value: stats.success + stats.no_jobs },
+    { label: "Обработано", value: stats.success + stats.no_jobs + (stats.unsupported ?? 0) + (stats.unverified ?? 0) },
     { label: "Вакансии", value: stats.jobs_found, tab: "jobs" },
+    { label: "Нет вакансий", value: stats.no_jobs, tab: "no_jobs" },
+    { label: "Не извлечено", value: stats.unsupported ?? 0, tab: "unsupported" },
+    { label: "Страница не найдена", value: stats.unverified ?? 0, tab: "unverified" },
     { label: "Заблокировано", value: stats.blocked, tab: "blocked" },
     { label: "Ошибки", value: stats.failed, tab: "failed" },
   ];
   return (
-    <section className="grid grid-cols-2 gap-3 lg:grid-cols-4" aria-label="Статистика поиска">
+    <section className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-7" aria-label="Статистика поиска">
       {cards.map((card) => card.tab ? (
         <button
           aria-pressed={activeTab === card.tab}

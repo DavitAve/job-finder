@@ -13,6 +13,7 @@ from job_finder.models import Company, CrawlReport
 from job_finder.output import write_report
 from job_finder.output import read_latest
 from job_finder.lifecycle import apply_job_lifecycle
+from job_finder.database import DatabaseStore
 
 
 class CrawlBusyError(RuntimeError):
@@ -30,9 +31,17 @@ class PreparedCrawl:
 class CrawlService:
     """Shared lock -> crawl -> commit lifecycle for CLI and HTTP callers."""
 
-    def __init__(self, companies_path: Path, output_directory: Path) -> None:
+    def __init__(
+        self,
+        companies_path: Path,
+        output_directory: Path,
+        database: DatabaseStore | None = None,
+        lock_path: Path | None = None,
+    ) -> None:
         self.companies_path = companies_path
         self.output_directory = output_directory
+        self.database = database
+        self.lock_path = lock_path or output_directory / "crawl.lock"
 
     def prepare(
         self,
@@ -40,9 +49,13 @@ class CrawlService:
         run_id: str | None = None,
         started_at: datetime | None = None,
     ) -> PreparedCrawl:
-        companies = load_companies(self.companies_path)
+        companies = (
+            self.database.list_companies()
+            if self.database is not None
+            else load_companies(self.companies_path)
+        )
         self.output_directory.mkdir(parents=True, exist_ok=True)
-        lock = FileLock(str(self.output_directory / "crawl.lock"))
+        lock = FileLock(str(self.lock_path))
         try:
             lock.acquire(timeout=0)
         except FileLockTimeout as exc:
@@ -69,7 +82,11 @@ class CrawlService:
         report_transform: Callable[[CrawlReport], CrawlReport] | None = None,
     ) -> CrawlReport:
         try:
-            previous = read_latest(self.output_directory)
+            previous = (
+                self.database.read_latest()
+                if self.database is not None
+                else read_latest(self.output_directory)
+            )
             report = await crawl_companies(
                 prepared.companies,
                 settings,
@@ -90,7 +107,16 @@ class CrawlService:
                 previous,
                 {company.name for company in prepared.companies},
             )
-            write_report(report, self.output_directory)
+            if self.database is not None:
+                self.database.write_report(report)
+                try:
+                    # Keep a disposable JSON export for debugging and older tools.
+                    # All application reads use the committed database record.
+                    write_report(report, self.output_directory)
+                except OSError:
+                    pass
+            else:
+                write_report(report, self.output_directory)
             return report
         finally:
             self.release(prepared)

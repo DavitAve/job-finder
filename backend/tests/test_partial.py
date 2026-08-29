@@ -38,3 +38,30 @@ def test_partial_report_replaces_selected_company_and_preserves_others() -> None
     }
     assert merged.stats.total_companies == 2
     assert merged.stats.jobs_found == 1
+
+
+def test_partial_report_preserves_unsupported_and_unverified_counts() -> None:
+    configured = [
+        Company(id="parser", name="Parser", website_url="https://parser.example"),
+        Company(id="missing", name="Missing", website_url="https://missing.example"),
+    ]
+    previous = report(
+        "old",
+        [
+            result("parser", "Parser", CompanyStatus.UNSUPPORTED, 0),
+            result("missing", "Missing", CompanyStatus.SUCCESS, 1),
+        ],
+        [job("old-missing", "Missing")],
+    )
+    partial = report("new", [result("missing", "Missing", CompanyStatus.UNVERIFIED, 0)], [])
+
+    merged = merge_partial_report(
+        previous,
+        partial,
+        configured,
+        {"missing"},
+        "selected",
+    )
+
+    assert merged.stats.unsupported == 1
+    assert merged.stats.unverified == 1

@@ -108,6 +108,7 @@ async def test_disabled_company_advances_progress() -> None:
     )
     assert report.stats.skipped == 1
     assert progress == [(1, 1, CompanyStatus.SKIPPED)]
+    assert report.companies[0].last_crawled_at is None
 
 
 class DiscoveredCareersExtractor:
@@ -129,6 +130,7 @@ async def test_crawler_records_discovered_careers_url() -> None:
     result = report.companies[0]
     assert result.resolved_careers_url == "https://jobs.example.com/acme"
     assert result.careers_url_discovered is True
+    assert result.last_crawled_at is not None
 
 
 async def test_crawler_report_allows_missing_configured_careers_url() -> None:
@@ -138,3 +140,74 @@ async def test_crawler_report_allows_missing_configured_careers_url() -> None:
         extractor=DiscoveredCareersExtractor(),
     )
     assert report.companies[0].careers_url is None
+
+
+class UnverifiedExtractor:
+    async def extract(self, item: Company) -> ExtractionResult:
+        return ExtractionResult(
+            jobs=[],
+            adapter="html",
+            warnings=["greenhouse adapter failed: HTTP 404"],
+            resolved_careers_url=str(item.careers_url),
+        )
+
+
+async def test_failed_ats_extraction_is_unverified_instead_of_no_jobs() -> None:
+    report = await crawl_companies(
+        [company("acme")],
+        CrawlSettings(),
+        extractor=UnverifiedExtractor(),
+    )
+
+    assert report.companies[0].status == CompanyStatus.UNVERIFIED
+    assert report.stats.unverified == 1
+    assert report.stats.no_jobs == 0
+    assert report.errors[0].status == CompanyStatus.UNVERIFIED
+
+
+class BusyBrowserExtractor:
+    async def extract(self, item: Company) -> ExtractionResult:
+        return ExtractionResult(
+            [],
+            "html",
+            ["Playwright page pool busy for more than 5s"],
+        )
+
+
+async def test_busy_browser_pool_is_unverified_instead_of_no_jobs() -> None:
+    company = Company(
+        id="dynamic",
+        name="Dynamic",
+        website_url="https://dynamic.example",
+        careers_url="https://dynamic.example/careers",
+    )
+    report = await crawl_companies(
+        [company],
+        CrawlSettings(browser_enabled=False),
+        extractor=BusyBrowserExtractor(),
+    )
+
+    assert report.companies[0].status == CompanyStatus.UNVERIFIED
+    assert report.stats.unverified == 1
+
+
+class VisibleButUnsupportedExtractor:
+    async def extract(self, item: Company) -> ExtractionResult:
+        return ExtractionResult(
+            [],
+            "html",
+            ["Visible job listings were found, but the parser extracted none"],
+        )
+
+
+async def test_visible_unparsed_jobs_are_unsupported_not_empty() -> None:
+    report = await crawl_companies(
+        [company("visual")],
+        CrawlSettings(browser_enabled=False),
+        extractor=VisibleButUnsupportedExtractor(),
+    )
+
+    assert report.companies[0].status == CompanyStatus.UNSUPPORTED
+    assert report.stats.unsupported == 1
+    assert report.stats.no_jobs == 0
+    assert report.errors[0].status == CompanyStatus.UNSUPPORTED

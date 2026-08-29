@@ -25,6 +25,11 @@ _BOARD_TEXT = re.compile(
     r"join (?:us|our team)|career opportunities)\b",
     re.IGNORECASE,
 )
+_NO_OPENINGS = re.compile(
+    r"\b(no (?:current |open )?(?:jobs?|openings?|vacancies|positions)|"
+    r"there are no .{0,30}(?:jobs?|openings?|vacancies|positions))\b",
+    re.IGNORECASE,
+)
 
 
 def _candidate_title(anchor: Tag) -> str:
@@ -36,11 +41,19 @@ def _candidate_title(anchor: Tag) -> str:
         parent = parent.parent if isinstance(parent, Tag) else None
         if parent is None:
             break
-        heading = parent.find(["h1", "h2", "h3", "h4", "h5", "strong"])
-        if heading:
-            heading_text = clean_text(heading.get_text(" ", strip=True))
-            if 3 <= len(heading_text) <= 180 and _ROLE_TEXT.search(heading_text):
-                return heading_text
+        # Many custom career cards use a generic "See role" link and keep the
+        # actual title in an adjacent paragraph/span instead of a heading.
+        for candidate in parent.find_all(
+            ["p", "span", "h1", "h2", "h3", "h4", "h5", "strong"],
+            recursive=True,
+        ):
+            candidate_text = clean_text(candidate.get_text(" ", strip=True))
+            if (
+                3 <= len(candidate_text) <= 180
+                and not _GENERIC_LINK_TEXT.fullmatch(candidate_text)
+                and _ROLE_TEXT.search(candidate_text)
+            ):
+                return candidate_text
     return ""
 
 
@@ -69,6 +82,40 @@ def extract_html_jobs(html: str, page_url: str) -> list[RawJob]:
             )
         )
     return jobs
+
+
+def has_visible_job_listings(html: str) -> bool:
+    """Conservatively detect rendered vacancy titles that generic parsing missed."""
+    soup = BeautifulSoup(html, "lxml")
+    for element in soup(["script", "style", "template", "noscript", "svg"]):
+        element.decompose()
+    visible = clean_text(soup.get_text(" ", strip=True))
+    if _NO_OPENINGS.search(visible):
+        return False
+    strong_containers = (
+        "article, [role='listitem'], [data-job-id], [class*='job-card'], "
+        "[class*='job_card'], [class*='job-listing'], [class*='job_listing']"
+    )
+    for element in soup.select(strong_containers):
+        text = clean_text(element.get_text(" ", strip=True))
+        if 4 <= len(text) <= 300 and _ROLE_TEXT.search(text):
+            return True
+    # A plain list item or table row is weak evidence: marketing/FAQ lists often
+    # mention software development. Require a vacancy/apply link in that row.
+    for element in soup.select("li, tr"):
+        text = clean_text(element.get_text(" ", strip=True))
+        if not (4 <= len(text) <= 300 and _ROLE_TEXT.search(text)):
+            continue
+        for anchor in element.find_all("a", href=True):
+            href = urljoin("https://placeholder.invalid", str(anchor.get("href")))
+            anchor_text = clean_text(anchor.get_text(" ", strip=True))
+            if _JOB_PATH.search(urlsplit(href).path) or re.search(
+                r"\b(?:apply|see|view)\s+(?:role|job)|apply now\b",
+                anchor_text,
+                re.IGNORECASE,
+            ):
+                return True
+    return False
 
 
 def discover_board_links(html: str, page_url: str, limit: int = 2) -> list[str]:

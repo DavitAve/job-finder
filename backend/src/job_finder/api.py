@@ -1,27 +1,37 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
-from fastapi import Body, FastAPI, HTTPException, Query, status
+import httpx
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from job_finder.crawler import CrawlSettings
+from job_finder.adapters.base import BlockedError, FetchError, HttpFetcher
 from job_finder.company_import import (
-    CompanyImportBusyError,
     CompanyImportResult,
     CompanyImportPreview,
-    import_companies_xlsx,
-    preview_companies_xlsx,
+    merge_companies,
+    preview_company_import,
+    read_uploaded_companies,
 )
-from job_finder.company_store import CompanyStoreBusyError, mutate_companies
-from job_finder.excel import load_companies
+from job_finder.database import DatabaseBusyError, DatabaseStore
+from job_finder.auth import (
+    SESSION_COOKIE,
+    AuthService,
+    AuthenticationError,
+    AuthUser,
+    LoginRequest,
+    RegisterRequest,
+)
+from job_finder.excel import write_companies
 from job_finder.models import Company, CompanyCrawlResult, CompanyStatus, CrawlReport, CrawlStats, Job
-from job_finder.output import list_history, read_latest, read_run
 from job_finder.partial import merge_partial_report
 from job_finder.service import CrawlBusyError, CrawlService, PreparedCrawl
 from job_finder.settings import AppSettings
@@ -40,11 +50,13 @@ class CrawlState(StrEnum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class CrawlScope(StrEnum):
     FULL = "full"
     NEW = "new"
+    STALE = "stale"
     SELECTED = "selected"
 
 
@@ -63,11 +75,14 @@ class CrawlStatus(BaseModel):
     jobs_found: int = 0
     success: int = 0
     no_jobs: int = 0
+    unsupported: int = 0
     blocked: int = 0
     failed: int = 0
+    unverified: int = 0
     skipped: int = 0
     last_company: str | None = None
     error: str | None = None
+    message: str | None = None
     scope: CrawlScope = CrawlScope.FULL
 
 
@@ -96,9 +111,13 @@ class CompanySummary(BaseModel):
     locations: str | None = None
     remote_compatibility: str | None = None
     frontend_compatibility: str | None = None
+    adapter: str = "auto"
+    last_adapter: str | None = None
     enabled: bool = True
     crawl_status: CompanyStatus | None = None
     jobs_found: int = 0
+    last_crawled_at: datetime | None = None
+    refresh_due: bool = True
 
 
 class CompanyUpdateRequest(BaseModel):
@@ -110,6 +129,32 @@ class CompanyUpdateRequest(BaseModel):
     locations: str | None = None
     remote_compatibility: str | None = None
     frontend_compatibility: str | None = None
+    adapter: Literal["auto", "html", "browser"] | None = None
+
+
+class CompanyDiagnostics(BaseModel):
+    company_id: str
+    company: str
+    configured_adapter: str
+    latest_result: CompanyCrawlResult | None = None
+    request_url: str
+    response_url: str | None = None
+    response_status: int | None = None
+    response_headers: dict[str, str] = Field(default_factory=dict)
+    raw_preview: str | None = None
+    raw_truncated: bool = False
+    fetch_error: str | None = None
+
+
+class CompanyHistoryItem(BaseModel):
+    run_id: str
+    checked_at: datetime
+    status: CompanyStatus
+    careers_url: str | None = None
+    adapter: str | None = None
+    jobs_found: int = 0
+    error: str | None = None
+    duration_ms: int = 0
 
 
 class CompanyBulkRequest(BaseModel):
@@ -131,14 +176,51 @@ class CareersDecisionRequest(BaseModel):
 CrawlAlreadyRunning = CrawlBusyError
 
 
+class CrawlNotRunning(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class RequestContext:
+    user: AuthUser
+    database: DatabaseStore
+
+
+def _is_refresh_due(
+    result: CompanyCrawlResult | None, cutoff: datetime
+) -> bool:
+    if result is None or result.last_crawled_at is None:
+        return True
+    checked_at = result.last_crawled_at
+    if checked_at.tzinfo is None:
+        checked_at = checked_at.replace(tzinfo=timezone.utc)
+    return checked_at <= cutoff
+
+
 class CrawlManager:
-    def __init__(self, app_settings: AppSettings) -> None:
+    def __init__(self, app_settings: AppSettings, database: DatabaseStore | None = None) -> None:
         self.app_settings = app_settings
+        self.database = database or DatabaseStore(app_settings.resolved_database_url)
+        if self.database.user_id == "local":
+            self.database.bootstrap_legacy(
+                app_settings.companies_path, app_settings.output_directory
+            )
+        else:
+            self.database.initialize()
         self.status = CrawlStatus()
         self._task: asyncio.Task[None] | None = None
+        self._prepared: PreparedCrawl | None = None
         self._state_lock = asyncio.Lock()
+        compatibility_output = (
+            app_settings.output_directory
+            if self.database.user_id == "local"
+            else app_settings.output_directory / "users" / self.database.user_id
+        )
         self.service = CrawlService(
-            app_settings.companies_path, app_settings.output_directory
+            app_settings.companies_path,
+            compatibility_output,
+            database=self.database,
+            lock_path=app_settings.output_directory / "crawl.lock",
         )
 
     async def start(self, request: CrawlRequest | None = None) -> CrawlStatus:
@@ -152,12 +234,26 @@ class CrawlManager:
                 raise CrawlAlreadyRunning(str(exc)) from exc
             try:
                 all_companies = list(prepared.companies)
-                previous = read_latest(self.app_settings.output_directory)
+                previous = self.database.read_latest()
                 if request.scope == CrawlScope.NEW:
                     processed = {
                         result.company_id for result in (previous.companies if previous else [])
                     }
                     selected = [company for company in all_companies if company.id not in processed]
+                elif request.scope == CrawlScope.STALE:
+                    previous_by_id = {
+                        result.company_id: result
+                        for result in (previous.companies if previous else [])
+                    }
+                    cutoff = datetime.now(timezone.utc) - timedelta(
+                        hours=self.app_settings.refresh_after_hours
+                    )
+                    selected = [
+                        company
+                        for company in all_companies
+                        if company.enabled
+                        and _is_refresh_due(previous_by_id.get(company.id), cutoff)
+                    ]
                 elif request.scope == CrawlScope.SELECTED:
                     requested_ids = set(request.company_ids)
                     known_ids = {company.id for company in all_companies}
@@ -168,6 +264,23 @@ class CrawlManager:
                 else:
                     selected = all_companies
                 if not selected:
+                    if request.scope in {CrawlScope.NEW, CrawlScope.STALE}:
+                        now = datetime.now(timezone.utc)
+                        message = (
+                            "No companies are due for refresh. All enabled companies were checked within the refresh interval."
+                            if request.scope == CrawlScope.STALE
+                            else "No new companies were found. All companies have already been processed."
+                        )
+                        self.status = CrawlStatus(
+                            state=CrawlState.COMPLETED,
+                            started_at=now,
+                            finished_at=now,
+                            total=0,
+                            scope=request.scope,
+                            message=message,
+                        )
+                        self.service.release(prepared)
+                        return self.status.model_copy(deep=True)
                     raise ValueError("No companies match the requested crawl scope")
                 prepared.companies = selected
             except BaseException:
@@ -181,11 +294,13 @@ class CrawlManager:
                 scope=request.scope,
             )
             try:
+                self._prepared = prepared
                 self._task = asyncio.create_task(
                     self._run(prepared, previous, all_companies, request.scope),
                     name=f"crawl-{prepared.run_id}",
                 )
             except BaseException:
+                self._prepared = None
                 self.service.release(prepared)
                 raise
             return self.status.model_copy(deep=True)
@@ -206,17 +321,24 @@ class CrawlManager:
                 self.status.success += 1
             elif result.status == CompanyStatus.NO_JOBS:
                 self.status.no_jobs += 1
+            elif result.status == CompanyStatus.UNSUPPORTED:
+                self.status.unsupported += 1
             elif result.status == CompanyStatus.BLOCKED:
                 self.status.blocked += 1
             elif result.status == CompanyStatus.FAILED:
                 self.status.failed += 1
+            elif result.status == CompanyStatus.UNVERIFIED:
+                self.status.unverified += 1
             elif result.status == CompanyStatus.SKIPPED:
                 self.status.skipped += 1
 
         try:
             report = await self.service.execute(
                 prepared,
-                CrawlSettings(concurrency=self.app_settings.concurrency),
+                CrawlSettings(
+                    concurrency=self.app_settings.concurrency,
+                    browser_pool_wait_seconds=self.app_settings.browser_pool_wait_seconds,
+                ),
                 progress_callback=on_progress,
                 report_transform=(
                     None
@@ -235,21 +357,49 @@ class CrawlManager:
             self.status.jobs_found = report.stats.jobs_found
             self.status.success = report.stats.success
             self.status.no_jobs = report.stats.no_jobs
+            self.status.unsupported = report.stats.unsupported
             self.status.blocked = report.stats.blocked
             self.status.failed = report.stats.failed
+            self.status.unverified = report.stats.unverified
             self.status.skipped = report.stats.skipped
         except asyncio.CancelledError:
-            self.status.state = CrawlState.FAILED
+            self.status.state = CrawlState.CANCELLED
             self.status.finished_at = datetime.now(timezone.utc)
-            self.status.error = "Crawl cancelled"
+            self.status.error = None
             raise
         except Exception as exc:
             self.status.state = CrawlState.FAILED
             self.status.finished_at = datetime.now(timezone.utc)
             self.status.error = f"{type(exc).__name__}: {exc}"
+        finally:
+            self.service.release(prepared)
+            if self._prepared is prepared:
+                self._prepared = None
 
     def snapshot(self) -> CrawlStatus:
         return self.status.model_copy(deep=True)
+
+    async def stop(self) -> CrawlStatus:
+        async with self._state_lock:
+            task = self._task
+            if task is None or task.done() or self.status.state != CrawlState.RUNNING:
+                raise CrawlNotRunning("No crawl is currently running")
+            prepared = self._prepared
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            finally:
+                if prepared is not None:
+                    self.service.release(prepared)
+                if self._prepared is prepared:
+                    self._prepared = None
+            if self.status.state == CrawlState.RUNNING:
+                self.status.state = CrawlState.CANCELLED
+                self.status.finished_at = datetime.now(timezone.utc)
+                self.status.error = None
+            return self.snapshot()
 
 
 def _summary(report: CrawlReport) -> RunSummary:
@@ -261,32 +411,127 @@ def _summary(report: CrawlReport) -> RunSummary:
     )
 
 
+def _add_missing_company_websites(report: CrawlReport, configured: list[Company]) -> CrawlReport:
+    """Enrich legacy snapshots without rewriting their stored JSON."""
+    if all(company.website_url for company in report.companies):
+        return report
+    websites_by_id = {company.id: str(company.website_url) for company in configured}
+    websites_by_name = {
+        company.name.casefold(): str(company.website_url) for company in configured
+    }
+    for company in report.companies:
+        if company.website_url is None:
+            company.website_url = websites_by_id.get(company.company_id) or websites_by_name.get(
+                company.company.casefold()
+            )
+    return report
+
+
+def _set_session_cookie(response: Response, token: str, settings: AppSettings) -> None:
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=token,
+        max_age=settings.session_days * 24 * 60 * 60,
+        httponly=True,
+        secure=settings.secure_cookies,
+        samesite="lax",
+        path="/",
+    )
+
+
 def create_app(
     app_settings: AppSettings | None = None,
     manager: CrawlManager | None = None,
 ) -> FastAPI:
     settings = app_settings or AppSettings.from_env()
-    crawl_manager = manager or CrawlManager(settings)
+    if manager is None:
+        crawl_manager = CrawlManager(settings)
+        database = crawl_manager.database
+    else:
+        crawl_manager = manager
+        database = DatabaseStore(settings.resolved_database_url)
+        database.bootstrap_legacy(settings.companies_path, settings.output_directory)
     app = FastAPI(title="Frontend Job Finder API", version="2.0.0")
     app.state.settings = settings
     app.state.crawl_manager = crawl_manager
+    app.state.database = database
+    auth_service = AuthService(database, session_days=settings.session_days)
+    managers: dict[str, CrawlManager] = {}
+    if isinstance(crawl_manager, CrawlManager):
+        managers[crawl_manager.database.user_id] = crawl_manager
+
+    def current_context(request: Request) -> RequestContext:
+        if not settings.auth_enabled:
+            raw = database.find_user_by_id("local")
+            return RequestContext(
+                user=AuthUser.model_validate(raw),  # type: ignore[arg-type]
+                database=database.scoped("local"),
+            )
+        user = auth_service.resolve(request.cookies.get(SESSION_COOKIE))
+        if user is None:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        return RequestContext(user=user, database=database.scoped(user.id))
+
+    def manager_for(context: RequestContext):
+        if not settings.auth_enabled and manager is not None:
+            return crawl_manager
+        existing = managers.get(context.user.id)
+        if existing is None:
+            existing = CrawlManager(settings, context.database)
+            managers[context.user.id] = existing
+        return existing
+
+    def resume_store_for(context: RequestContext) -> ResumeStore:
+        directory = (
+            settings.resumes_directory
+            if context.user.id == "local"
+            else settings.resumes_directory / context.user.id
+        )
+        return ResumeStore(directory, database=context.database)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
         allow_methods=["GET", "POST", "PATCH", "DELETE"],
         allow_headers=["*"],
+        allow_credentials=True,
     )
 
     @app.get("/api/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    resume_store = ResumeStore(settings.resumes_directory)
+    @app.post("/api/auth/register", response_model=AuthUser, status_code=status.HTTP_201_CREATED)
+    def register(request: RegisterRequest, response: Response) -> AuthUser:
+        try:
+            session = auth_service.register(request)
+        except AuthenticationError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        _set_session_cookie(response, session.token, settings)
+        return session.user
+
+    @app.post("/api/auth/login", response_model=AuthUser)
+    def login(request: LoginRequest, response: Response) -> AuthUser:
+        try:
+            session = auth_service.login(request)
+        except AuthenticationError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        _set_session_cookie(response, session.token, settings)
+        return session.user
+
+    @app.post("/api/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
+    def logout(request: Request, response: Response) -> None:
+        auth_service.logout(request.cookies.get(SESSION_COOKIE))
+        response.delete_cookie(SESSION_COOKIE, path="/", samesite="lax")
+
+    @app.get("/api/auth/me", response_model=AuthUser)
+    def me(context: RequestContext = Depends(current_context)) -> AuthUser:
+        return context.user
 
     @app.get("/api/resumes", response_model=ResumeList)
-    def list_resumes() -> ResumeList:
+    def list_resumes(context: RequestContext = Depends(current_context)) -> ResumeList:
         try:
-            return resume_store.list()
+            return resume_store_for(context).list()
         except (OSError, ValueError) as exc:
             raise HTTPException(status_code=500, detail=f"Cannot read resumes: {exc}") from exc
 
@@ -295,40 +540,48 @@ def create_app(
         filename: str = Query(..., min_length=1, max_length=255),
         language: Literal["en", "ru"] = Query(...),
         content: bytes = Body(..., media_type="application/pdf"),
+        context: RequestContext = Depends(current_context),
     ) -> ResumeList:
         try:
-            return resume_store.add(content, filename, language)
+            return resume_store_for(context).add(content, filename, language)
         except ResumeBusyError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ResumeError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.patch("/api/resumes/{resume_id}/activate", response_model=ResumeList)
-    def activate_resume(resume_id: str) -> ResumeList:
+    def activate_resume(
+        resume_id: str, context: RequestContext = Depends(current_context)
+    ) -> ResumeList:
         try:
-            return resume_store.activate(resume_id)
+            return resume_store_for(context).activate(resume_id)
         except ResumeBusyError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ResumeError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.delete("/api/resumes/{resume_id}", response_model=ResumeList)
-    def delete_resume(resume_id: str) -> ResumeList:
+    def delete_resume(
+        resume_id: str, context: RequestContext = Depends(current_context)
+    ) -> ResumeList:
         try:
-            return resume_store.delete(resume_id)
+            return resume_store_for(context).delete(resume_id)
         except ResumeBusyError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ResumeError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/resume-matches", response_model=ResumeMatches)
-    def resume_matches(run_id: str | None = Query(default=None)) -> ResumeMatches:
+    def resume_matches(
+        run_id: str | None = Query(default=None),
+        context: RequestContext = Depends(current_context),
+    ) -> ResumeMatches:
         try:
-            resume = resume_store.active()
+            resume = resume_store_for(context).active()
             report = (
-                read_run(settings.output_directory, run_id)
+                context.database.read_run(run_id)
                 if run_id
-                else read_latest(settings.output_directory)
+                else context.database.read_latest()
             )
         except (OSError, ValueError) as exc:
             raise HTTPException(status_code=500, detail=f"Cannot calculate resume matches: {exc}") from exc
@@ -340,19 +593,20 @@ def create_app(
         )
 
     @app.get("/api/companies", response_model=list[CompanySummary])
-    async def companies() -> list[CompanySummary]:
+    async def companies(
+        context: RequestContext = Depends(current_context),
+    ) -> list[CompanySummary]:
         try:
-            configured = (
-                load_companies(settings.companies_path)
-                if settings.companies_path.exists()
-                else []
-            )
-            latest = read_latest(settings.output_directory)
+            configured = context.database.list_companies()
+            latest = context.database.read_latest()
         except (OSError, ValueError) as exc:
             raise HTTPException(status_code=500, detail=f"Cannot read companies: {exc}") from exc
         latest_by_id = {
             result.company_id: result for result in (latest.companies if latest else [])
         }
+        refresh_cutoff = datetime.now(timezone.utc) - timedelta(
+            hours=settings.refresh_after_hours
+        )
         return [
             CompanySummary(
                 id=company.id,
@@ -381,26 +635,153 @@ def create_app(
                 locations=company.metadata.get("Страна / основные локации"),
                 remote_compatibility=company.metadata.get("Remote из Армении"),
                 frontend_compatibility=company.metadata.get("Frontend compatibility"),
+                adapter=company.adapter,
+                last_adapter=result.adapter if result else None,
                 enabled=company.enabled,
                 crawl_status=result.status if result else None,
                 jobs_found=result.matching_jobs if result else 0,
+                last_crawled_at=result.last_crawled_at if result else None,
+                refresh_due=bool(
+                    company.enabled
+                    and _is_refresh_due(result, refresh_cutoff)
+                ),
             )
             for company in configured
             for result in [latest_by_id.get(company.id)]
         ]
 
-    def mutate_company_list(mutation) -> tuple[list, Path]:
+    @app.get("/api/companies/{company_id}/diagnostics", response_model=CompanyDiagnostics)
+    async def company_diagnostics(
+        company_id: str, context: RequestContext = Depends(current_context)
+    ) -> CompanyDiagnostics:
         try:
-            return mutate_companies(
-                settings.companies_path, settings.output_directory, mutation
+            configured = context.database.list_companies()
+            latest = context.database.read_latest()
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=500, detail=f"Cannot read company diagnostics: {exc}") from exc
+        company = next((item for item in configured if item.id == company_id), None)
+        if company is None:
+            raise HTTPException(status_code=404, detail="Company not found")
+        result = next(
+            (item for item in (latest.companies if latest else []) if item.company_id == company_id),
+            None,
+        )
+        request_url = str(
+            company.careers_url
+            or (result.resolved_careers_url if result else None)
+            or company.website_url
+        )
+        diagnostics = CompanyDiagnostics(
+            company_id=company.id,
+            company=company.name,
+            configured_adapter=company.adapter,
+            latest_result=result,
+            request_url=request_url,
+        )
+        try:
+            async with httpx.AsyncClient() as client:
+                page = await HttpFetcher(
+                    client,
+                    timeout_seconds=10,
+                    retries=0,
+                    max_response_bytes=2_000_000,
+                ).fetch(request_url)
+            raw = page.text
+            diagnostics.response_url = page.url
+            diagnostics.response_status = page.status_code
+            diagnostics.response_headers = {
+                key: value
+                for key in ("content-type", "content-length", "cache-control", "server")
+                if (value := page.headers.get(key))
+            }
+            diagnostics.raw_preview = raw[:50_000]
+            diagnostics.raw_truncated = len(raw) > 50_000
+        except (BlockedError, FetchError) as exc:
+            diagnostics.fetch_error = str(exc)
+        return diagnostics
+
+    @app.get("/api/companies/{company_id}/history", response_model=list[CompanyHistoryItem])
+    async def company_history(
+        company_id: str,
+        limit: int = Query(default=5, ge=3, le=5),
+        context: RequestContext = Depends(current_context),
+    ) -> list[CompanyHistoryItem]:
+        try:
+            configured = context.database.list_companies()
+            latest = context.database.read_latest()
+            previous = context.database.list_history(10)
+            stored = context.database.read_company_history(company_id, limit=limit)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=500, detail=f"Cannot read company history: {exc}") from exc
+        if not any(company.id == company_id for company in configured):
+            raise HTTPException(status_code=404, detail="Company not found")
+        items: dict[str, CompanyHistoryItem] = {}
+        for raw in stored:
+            try:
+                item = CompanyHistoryItem.model_validate(raw)
+            except ValueError:
+                continue
+            items[item.run_id] = item
+        for report in [item for item in [latest, *previous] if item is not None]:
+            processed_ids = set(report.processed_company_ids)
+            was_processed = (
+                company_id in processed_ids
+                if processed_ids
+                else report.scope == "full"
             )
-        except CompanyStoreBusyError as exc:
+            if not was_processed or report.run_id in items:
+                continue
+            result = next(
+                (entry for entry in report.companies if entry.company_id == company_id),
+                None,
+            )
+            if result is None or result.status == CompanyStatus.SKIPPED:
+                continue
+            items[report.run_id] = CompanyHistoryItem(
+                run_id=report.run_id,
+                checked_at=result.last_crawled_at or report.finished_at,
+                status=result.status,
+                careers_url=result.resolved_careers_url or result.careers_url,
+                adapter=result.adapter,
+                jobs_found=result.matching_jobs,
+                error=result.error,
+                duration_ms=result.duration_ms,
+            )
+        return sorted(items.values(), key=lambda item: item.checked_at, reverse=True)[:limit]
+
+    def mutate_company_list(
+        context: RequestContext, mutation
+    ) -> tuple[list, Path]:
+        try:
+            updated, backup = context.database.mutate_companies(
+                mutation,
+                lock_path=settings.output_directory / "crawl.lock",
+                backup_directory=(
+                    settings.output_directory / "import-backups"
+                    if context.user.id == "local"
+                    else settings.output_directory / "users" / context.user.id / "import-backups"
+                ),
+            )
+            # Compatibility export for CLI tools and easy manual inspection.
+            # SQLite remains the source of truth after the first bootstrap.
+            export_path = (
+                settings.companies_path
+                if context.user.id == "local"
+                else settings.output_directory / "users" / context.user.id / "companies.json"
+            )
+            write_companies(export_path, updated)
+            return updated, backup
+        except DatabaseBusyError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.patch("/api/companies/{company_id}", response_model=CompanyMutationResult)
-    def update_company(company_id: str, request: CompanyUpdateRequest) -> CompanyMutationResult:
+    def update_company(
+        company_id: str,
+        request: CompanyUpdateRequest,
+        context: RequestContext = Depends(current_context),
+    ) -> CompanyMutationResult:
         changed = 0
 
         def mutation(companies):
@@ -424,7 +805,7 @@ def create_app(
                             metadata[key] = value
                         else:
                             metadata.pop(key, None)
-                for field in ("name", "website_url", "enabled"):
+                for field in ("name", "website_url", "enabled", "adapter"):
                     if field in request.model_fields_set:
                         values[field] = getattr(request, field)
                 if "careers_url" in request.model_fields_set:
@@ -436,11 +817,14 @@ def create_app(
                 raise ValueError("Company not found")
             return updated
 
-        updated, backup = mutate_company_list(mutation)
+        updated, backup = mutate_company_list(context, mutation)
         return CompanyMutationResult(changed=changed, total=len(updated), backup_file=str(backup))
 
     @app.post("/api/companies/bulk", response_model=CompanyMutationResult)
-    def bulk_companies(request: CompanyBulkRequest) -> CompanyMutationResult:
+    def bulk_companies(
+        request: CompanyBulkRequest,
+        context: RequestContext = Depends(current_context),
+    ) -> CompanyMutationResult:
         selected = set(request.company_ids)
         changed = 0
 
@@ -459,11 +843,15 @@ def create_app(
                     updated.append(company)
             return updated
 
-        updated, backup = mutate_company_list(mutation)
+        updated, backup = mutate_company_list(context, mutation)
         return CompanyMutationResult(changed=changed, total=len(updated), backup_file=str(backup))
 
     @app.post("/api/companies/{company_id}/careers-decision", response_model=CompanyMutationResult)
-    def decide_careers(company_id: str, request: CareersDecisionRequest) -> CompanyMutationResult:
+    def decide_careers(
+        company_id: str,
+        request: CareersDecisionRequest,
+        context: RequestContext = Depends(current_context),
+    ) -> CompanyMutationResult:
         changed = 0
 
         def mutation(companies):
@@ -492,7 +880,7 @@ def create_app(
                 raise ValueError("Company not found")
             return updated
 
-        updated, backup = mutate_company_list(mutation)
+        updated, backup = mutate_company_list(context, mutation)
         return CompanyMutationResult(changed=changed, total=len(updated), backup_file=str(backup))
 
     @app.post("/api/companies/import/preview", response_model=CompanyImportPreview)
@@ -501,13 +889,15 @@ def create_app(
         reset_existing: bool = Query(False),
         deduplicate: bool = Query(True),
         content: bytes = Body(..., media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        context: RequestContext = Depends(current_context),
     ) -> CompanyImportPreview:
         if Path(filename).suffix.casefold() != ".xlsx":
             raise HTTPException(status_code=422, detail="Only .xlsx files are supported")
         try:
-            return preview_companies_xlsx(
-                content,
-                companies_path=settings.companies_path,
+            uploaded = read_uploaded_companies(content)
+            return preview_company_import(
+                context.database.list_companies(),
+                uploaded,
                 reset_existing=reset_existing,
                 deduplicate=deduplicate,
             )
@@ -520,19 +910,33 @@ def create_app(
         reset_existing: bool = Query(False),
         deduplicate: bool = Query(True),
         content: bytes = Body(..., media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        context: RequestContext = Depends(current_context),
     ) -> CompanyImportResult:
         if Path(filename).suffix.casefold() != ".xlsx":
             raise HTTPException(status_code=422, detail="Only .xlsx files are supported")
         try:
-            return import_companies_xlsx(
-                content,
-                companies_path=settings.companies_path,
-                output_directory=settings.output_directory,
-                reset_existing=reset_existing,
-                deduplicate=deduplicate,
+            uploaded = read_uploaded_companies(content)
+            counts: dict[str, int] = {}
+
+            def mutation(existing: list[Company]) -> list[Company]:
+                merged, added, skipped = merge_companies(
+                    existing,
+                    uploaded,
+                    reset_existing=reset_existing,
+                    deduplicate=deduplicate,
+                )
+                counts.update(added=added, skipped=skipped)
+                return merged
+
+            merged, backup = mutate_company_list(context, mutation)
+            return CompanyImportResult(
+                uploaded=len(uploaded),
+                added=counts["added"],
+                duplicates_skipped=counts["skipped"],
+                total=len(merged),
+                replaced_existing=reset_existing,
+                backup_file=str(backup),
             )
-        except CompanyImportBusyError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (OSError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=f"Cannot import XLSX: {exc}") from exc
 
@@ -541,9 +945,12 @@ def create_app(
         response_model=CrawlStatus,
         status_code=status.HTTP_202_ACCEPTED,
     )
-    async def start_crawl(request: CrawlRequest | None = None) -> CrawlStatus:
+    async def start_crawl(
+        request: CrawlRequest | None = None,
+        context: RequestContext = Depends(current_context),
+    ) -> CrawlStatus:
         try:
-            return await crawl_manager.start(request)
+            return await manager_for(context).start(request)
         except CrawlAlreadyRunning as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
@@ -552,24 +959,43 @@ def create_app(
             raise HTTPException(status_code=500, detail=f"Cannot start crawl: {exc}") from exc
 
     @app.get("/api/crawls/status", response_model=CrawlStatus)
-    async def crawl_status() -> CrawlStatus:
-        return crawl_manager.snapshot()
+    async def crawl_status(
+        context: RequestContext = Depends(current_context),
+    ) -> CrawlStatus:
+        return manager_for(context).snapshot()
+
+    @app.post(
+        "/api/crawls/stop",
+        response_model=CrawlStatus,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def stop_crawl(
+        context: RequestContext = Depends(current_context),
+    ) -> CrawlStatus:
+        try:
+            return await manager_for(context).stop()
+        except CrawlNotRunning as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/runs/latest", response_model=CrawlReport)
-    async def latest_run() -> CrawlReport:
+    async def latest_run(
+        context: RequestContext = Depends(current_context),
+    ) -> CrawlReport:
         try:
-            report = read_latest(settings.output_directory)
+            report = context.database.read_latest()
         except (OSError, ValueError) as exc:
             raise HTTPException(status_code=500, detail=f"Cannot read latest run: {exc}") from exc
         if report is None:
             raise HTTPException(status_code=404, detail="No completed crawl exists")
-        return report
+        return _add_missing_company_websites(report, context.database.list_companies())
 
     @app.get("/api/jobs/changes", response_model=JobChanges)
-    async def job_changes() -> JobChanges:
+    async def job_changes(
+        context: RequestContext = Depends(current_context),
+    ) -> JobChanges:
         try:
-            latest = read_latest(settings.output_directory)
-            history = list_history(settings.output_directory, 1)
+            latest = context.database.read_latest()
+            history = context.database.list_history(1)
         except (OSError, ValueError) as exc:
             raise HTTPException(status_code=500, detail=f"Cannot read job changes: {exc}") from exc
         if latest is None:
@@ -583,21 +1009,26 @@ def create_app(
         )
 
     @app.get("/api/runs/history", response_model=list[RunSummary])
-    async def run_history(limit: int = Query(default=3, ge=1, le=3)) -> list[RunSummary]:
+    async def run_history(
+        limit: int = Query(default=3, ge=1, le=3),
+        context: RequestContext = Depends(current_context),
+    ) -> list[RunSummary]:
         try:
-            return [_summary(report) for report in list_history(settings.output_directory, limit)]
+            return [_summary(report) for report in context.database.list_history(limit)]
         except (OSError, ValueError) as exc:
             raise HTTPException(status_code=500, detail=f"Cannot read crawl history: {exc}") from exc
 
     @app.get("/api/runs/{run_id}", response_model=CrawlReport)
-    async def run_details(run_id: str) -> CrawlReport:
+    async def run_details(
+        run_id: str, context: RequestContext = Depends(current_context)
+    ) -> CrawlReport:
         try:
-            report = read_run(settings.output_directory, run_id)
+            report = context.database.read_run(run_id)
         except (OSError, ValueError) as exc:
             raise HTTPException(status_code=500, detail=f"Cannot read crawl run: {exc}") from exc
         if report is None:
             raise HTTPException(status_code=404, detail="Crawl run not found")
-        return report
+        return _add_missing_company_websites(report, context.database.list_companies())
 
     return app
 

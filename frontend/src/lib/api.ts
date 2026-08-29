@@ -1,4 +1,5 @@
-import type { ActiveRun, CompanyImportPreview, CompanyImportResult, CompanyMutationResult, CompanySummary, CrawlReport, JobChanges, ResumeList, ResumeMatches, RunSummary } from "../types";
+import type { ActiveRun, AuthUser, CompanyDiagnostics, CompanyHistoryItem, CompanyImportPreview, CompanyImportResult, CompanyMutationResult, CompanySummary, CrawlReport, JobChanges, ResumeList, ResumeMatches, RunSummary } from "../types";
+import { announceApiUnavailable } from "./events";
 
 export class ApiError extends Error {
   constructor(
@@ -10,25 +11,44 @@ export class ApiError extends Error {
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, {
-    headers: { Accept: "application/json", ...init?.headers },
-    ...init,
-  });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      credentials: "include",
+      headers: { Accept: "application/json", ...init?.headers },
+      ...init,
+    });
+  } catch (error) {
+    announceApiUnavailable();
+    throw error;
+  }
   if (!response.ok) {
     let message = `Ошибка API (${response.status})`;
+    let hasApiDetail = false;
     try {
       const body = (await response.json()) as { detail?: string };
-      if (body.detail) message = body.detail;
+      if (body.detail) {
+        message = body.detail;
+        hasApiDetail = true;
+      }
     } catch {
       // The default message is useful when the response is not JSON.
     }
+    if (response.status >= 500 && !hasApiDetail) announceApiUnavailable();
     throw new ApiError(message, response.status);
   }
+  if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 
 export const api = {
+  me: () => request<AuthUser>("/api/auth/me"),
+  register: (values: { email: string; password: string; display_name: string }) => request<AuthUser>("/api/auth/register", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(values) }),
+  login: (values: { email: string; password: string }) => request<AuthUser>("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(values) }),
+  logout: () => request<void>("/api/auth/logout", { method: "POST" }),
   companies: () => request<CompanySummary[]>("/api/companies"),
+  companyDiagnostics: (companyId: string) => request<CompanyDiagnostics>(`/api/companies/${encodeURIComponent(companyId)}/diagnostics`),
+  companyHistory: (companyId: string) => request<CompanyHistoryItem[]>(`/api/companies/${encodeURIComponent(companyId)}/history?limit=5`),
   importCompanies: (file: File, options: { resetExisting: boolean; deduplicate: boolean }) => {
     const query = new URLSearchParams({
       filename: file.name,
@@ -60,7 +80,8 @@ export const api = {
   history: () => request<RunSummary[]>("/api/runs/history?limit=3"),
   report: (runId: string) => request<CrawlReport>(`/api/runs/${encodeURIComponent(runId)}`),
   active: () => request<ActiveRun>("/api/crawls/status"),
-  start: (options: { scope: "full" | "new" | "selected"; company_ids?: string[] } = { scope: "full" }) => request<ActiveRun>("/api/crawls", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(options) }),
+  start: (options: { scope: "full" | "new" | "stale" | "selected"; company_ids?: string[] } = { scope: "full" }) => request<ActiveRun>("/api/crawls", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(options) }),
+  stop: () => request<ActiveRun>("/api/crawls/stop", { method: "POST" }),
   jobChanges: () => request<JobChanges>("/api/jobs/changes"),
   resumes: () => request<ResumeList>("/api/resumes"),
   uploadResume: (file: File, language: "en" | "ru") => {

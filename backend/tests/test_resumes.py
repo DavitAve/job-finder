@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import pytest
 
 from job_finder.models import Job
+from job_finder.database import DatabaseStore
 from job_finder.resumes import ResumeError, ResumeRecord, ResumeStore, score_job
 
 
@@ -28,6 +29,19 @@ def test_resume_store_limits_duplicates_and_tracks_active(tmp_path, monkeypatch)
     remaining = store.delete(activated.active_id)
     assert len(remaining.resumes) == 2
     assert remaining.active_id == remaining.resumes[0].id
+
+
+def test_resume_store_uses_user_scoped_database(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("job_finder.resumes._extract_pdf", lambda content: ("Frontend Vue TypeScript", 1))
+    database = DatabaseStore(f"sqlite:///{(tmp_path / 'job_finder.db').as_posix()}")
+    database.initialize()
+    directory = tmp_path / "resumes"
+
+    created = ResumeStore(directory, database=database).add(b"%PDF-database", "resume.pdf", "en")
+    reopened = ResumeStore(directory, database=database).list()
+
+    assert reopened.active_id == created.active_id
+    assert reopened.resumes[0].skills == ["Vue", "TypeScript"]
 
 
 def test_resume_match_scores_relevant_job_higher() -> None:

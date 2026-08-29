@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 import time
 from datetime import datetime, timezone
 from collections.abc import Awaitable, Callable
@@ -27,11 +28,12 @@ from job_finder.models import (
 class CrawlSettings(BaseModel):
     concurrency: int = Field(default=8, ge=1, le=50)
     per_domain: int = Field(default=2, ge=1, le=5)
-    request_timeout_seconds: float = Field(default=15.0, gt=0, le=120)
+    request_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
     company_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
     retries: int = Field(default=2, ge=0, le=5)
     browser_enabled: bool = True
     browser_pages: int = Field(default=2, ge=1, le=5)
+    browser_pool_wait_seconds: float = Field(default=30.0, gt=0, le=120)
     respect_robots: bool = True
 
 
@@ -46,6 +48,29 @@ ProgressCallback = Callable[
 
 def _status_count(results: list[CompanyCrawlResult], status: CompanyStatus) -> int:
     return sum(result.status == status for result in results)
+
+
+_UNVERIFIED_WARNING = re.compile(
+    r"(?:\b(?:greenhouse|lever|workday|ashby|smartrecruiters|recruitee|workable|"
+    r"pinpoint|bamboohr|rippling|staff\.am) "
+    r"adapter failed|browser (?:render|pagination) failed|"
+    r"playwright (?:unavailable|page pool busy)|"
+    r"pagination page failed|careers page could not be verified|"
+    r"careers page was not found)",
+    re.IGNORECASE,
+)
+_UNSUPPORTED_WARNING = re.compile(
+    r"visible job listings were found, but the parser extracted none",
+    re.IGNORECASE,
+)
+
+
+def _is_unverified_extraction(jobs_found: int, warnings: list[str]) -> bool:
+    return jobs_found == 0 and any(_UNVERIFIED_WARNING.search(warning) for warning in warnings)
+
+
+def _is_unsupported_extraction(jobs_found: int, warnings: list[str]) -> bool:
+    return jobs_found == 0 and any(_UNSUPPORTED_WARNING.search(warning) for warning in warnings)
 
 
 async def crawl_companies(
@@ -71,7 +96,10 @@ async def crawl_companies(
             retries=settings.retries,
             respect_robots=settings.respect_robots,
         )
-        browser = BrowserRenderer(max_pages=settings.browser_pages)
+        browser = BrowserRenderer(
+            max_pages=settings.browser_pages,
+            pool_wait_seconds=settings.browser_pool_wait_seconds,
+        )
         extractor = AutoAdapter(
             fetcher,
             browser=browser,
@@ -101,11 +129,13 @@ async def crawl_companies(
 
     async def process(index: int, company: Company) -> None:
         began = time.monotonic()
+        website_url = str(company.website_url)
         careers_url = str(company.careers_url) if company.careers_url else None
         if not company.enabled:
             results[index] = CompanyCrawlResult(
                 company_id=company.id,
                 company=company.name,
+                website_url=website_url,
                 careers_url=careers_url,
                 status=CompanyStatus.SKIPPED,
             )
@@ -122,10 +152,19 @@ async def crawl_companies(
                 if (job := normalize_job(raw, company, found_at)) is not None
             ]
             jobs_by_company[index] = normalized
-            status = CompanyStatus.SUCCESS if normalized else CompanyStatus.NO_JOBS
+            status = (
+                CompanyStatus.SUCCESS
+                if normalized
+                else CompanyStatus.UNSUPPORTED
+                if _is_unsupported_extraction(len(extracted.jobs), extracted.warnings)
+                else CompanyStatus.UNVERIFIED
+                if _is_unverified_extraction(len(extracted.jobs), extracted.warnings)
+                else CompanyStatus.NO_JOBS
+            )
             results[index] = CompanyCrawlResult(
                 company_id=company.id,
                 company=company.name,
+                website_url=website_url,
                 careers_url=careers_url,
                 resolved_careers_url=extracted.resolved_careers_url,
                 careers_url_discovered=extracted.careers_url_discovered,
@@ -133,12 +172,20 @@ async def crawl_companies(
                 adapter=extracted.adapter,
                 candidates_found=len(extracted.jobs),
                 matching_jobs=len(normalized),
+                error=(
+                    "Vacancy extraction could not be verified; see warnings"
+                    if status == CompanyStatus.UNVERIFIED
+                    else "Vacancies are visible, but the current parser could not extract them"
+                    if status == CompanyStatus.UNSUPPORTED
+                    else None
+                ),
                 warnings=extracted.warnings,
             )
         except BlockedError as exc:
             results[index] = CompanyCrawlResult(
                 company_id=company.id,
                 company=company.name,
+                website_url=website_url,
                 careers_url=careers_url,
                 status=CompanyStatus.BLOCKED,
                 error=str(exc),
@@ -147,6 +194,7 @@ async def crawl_companies(
             results[index] = CompanyCrawlResult(
                 company_id=company.id,
                 company=company.name,
+                website_url=website_url,
                 careers_url=careers_url,
                 status=CompanyStatus.FAILED,
                 error=f"Company timeout after {settings.company_timeout_seconds:g}s",
@@ -155,12 +203,15 @@ async def crawl_companies(
             results[index] = CompanyCrawlResult(
                 company_id=company.id,
                 company=company.name,
+                website_url=website_url,
                 careers_url=careers_url,
                 status=CompanyStatus.FAILED,
                 error=f"{type(exc).__name__}: {exc}",
             )
         finally:
             if results[index] is not None:
+                if results[index].status != CompanyStatus.SKIPPED:
+                    results[index].last_crawled_at = datetime.now(timezone.utc)
                 results[index].duration_ms = round((time.monotonic() - began) * 1000)
                 await notify_progress(results[index])
 
@@ -216,14 +267,22 @@ async def crawl_companies(
             message=result.error or "unknown error",
         )
         for result in completed_results
-        if result.status in {CompanyStatus.BLOCKED, CompanyStatus.FAILED}
+        if result.status
+        in {
+            CompanyStatus.BLOCKED,
+            CompanyStatus.FAILED,
+            CompanyStatus.UNVERIFIED,
+            CompanyStatus.UNSUPPORTED,
+        }
     ]
     stats = CrawlStats(
         total_companies=len(companies),
         success=_status_count(completed_results, CompanyStatus.SUCCESS),
         no_jobs=_status_count(completed_results, CompanyStatus.NO_JOBS),
+        unsupported=_status_count(completed_results, CompanyStatus.UNSUPPORTED),
         blocked=_status_count(completed_results, CompanyStatus.BLOCKED),
         failed=_status_count(completed_results, CompanyStatus.FAILED),
+        unverified=_status_count(completed_results, CompanyStatus.UNVERIFIED),
         skipped=_status_count(completed_results, CompanyStatus.SKIPPED),
         jobs_found=len(deduplicated),
         duplicates_removed=len(all_jobs) - len(deduplicated),

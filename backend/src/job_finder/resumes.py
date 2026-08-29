@@ -9,13 +9,16 @@ import tempfile
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from filelock import FileLock, Timeout as FileLockTimeout
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
 from job_finder.models import Job
+
+if TYPE_CHECKING:
+    from job_finder.database import DatabaseStore
 
 
 MAX_RESUMES = 3
@@ -140,16 +143,32 @@ def _extract_pdf(content: bytes) -> tuple[str, int]:
 
 
 class ResumeStore:
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, database: DatabaseStore | None = None) -> None:
         self.directory = directory
         self.index_path = directory / "index.json"
         self.lock = FileLock(str(directory / "resumes.lock"))
+        self.database = database
+        if database is not None:
+            records, _ = database.read_resumes()
+            if not records and self.index_path.exists():
+                legacy_records, active_id = self._read_index()
+                database.replace_resumes(
+                    [record.model_dump(mode="json") for record in legacy_records],
+                    active_id,
+                    directory,
+                )
 
-    def _read(self) -> tuple[list[ResumeRecord], str | None]:
+    def _read_index(self) -> tuple[list[ResumeRecord], str | None]:
         if not self.index_path.exists():
             return [], None
         data = json.loads(self.index_path.read_text(encoding="utf-8"))
         return [ResumeRecord.model_validate(item) for item in data.get("resumes", [])], data.get("active_id")
+
+    def _read(self) -> tuple[list[ResumeRecord], str | None]:
+        if self.database is None:
+            return self._read_index()
+        records, active_id = self.database.read_resumes()
+        return [ResumeRecord.model_validate(item) for item in records], active_id
 
     def _write(self, records: list[ResumeRecord], active_id: str | None) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -157,6 +176,8 @@ class ResumeStore:
             "active_id": active_id,
             "resumes": [record.model_dump(mode="json") for record in records],
         }
+        if self.database is not None:
+            self.database.replace_resumes(payload["resumes"], active_id, self.directory)
         handle, temporary = tempfile.mkstemp(prefix="resumes-", suffix=".json.tmp", dir=self.directory)
         try:
             with os.fdopen(handle, "w", encoding="utf-8") as stream:

@@ -4,7 +4,7 @@ import json
 import re
 import unicodedata
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from openpyxl import load_workbook
 
@@ -60,8 +60,8 @@ def _string(value: Any) -> str:
     return str(value).strip() if value is not None else ""
 
 
-def read_companies_from_xlsx(path: Path) -> list[Company]:
-    workbook = load_workbook(path, read_only=True, data_only=True)
+def read_companies_from_xlsx(source: Path | BinaryIO) -> list[Company]:
+    workbook = load_workbook(source, read_only=True, data_only=True)
     try:
         worksheet = workbook.active
         rows = worksheet.iter_rows(values_only=True)

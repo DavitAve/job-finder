@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from openpyxl import Workbook
 from typer.testing import CliRunner
@@ -36,3 +37,19 @@ def test_import_writes_full_file_when_legacy_sample_companies_are_missing(tmp_pa
     assert len(json.loads(output.read_text("utf-8"))) == 1
     assert not sample_output.exists()
     assert "Sample file was not updated" in result.output
+
+
+def test_db_upgrade_uses_absolute_migrations_path(monkeypatch) -> None:
+    observed: dict[str, str] = {}
+
+    def fake_upgrade(config, revision) -> None:
+        observed["script_location"] = config.get_main_option("script_location")
+        observed["revision"] = revision
+
+    monkeypatch.setattr("alembic.command.upgrade", fake_upgrade)
+    result = CliRunner().invoke(app, ["db-upgrade"])
+
+    assert result.exit_code == 0
+    assert Path(observed["script_location"]).is_absolute()
+    assert Path(observed["script_location"]).name == "migrations"
+    assert observed["revision"] == "head"

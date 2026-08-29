@@ -30,8 +30,10 @@ describe("JobFilters", () => {
     const user = userEvent.setup();
     render(<Harness />);
 
+    await user.click(screen.getByRole("button", { name: "Любой стек" }));
     await user.click(screen.getByRole("checkbox", { name: "React" }));
     await user.click(screen.getByRole("checkbox", { name: "Vue" }));
+    await user.click(screen.getByRole("button", { name: "Не исключать" }));
     await user.click(screen.getByRole("checkbox", { name: "Acme" }));
     await user.type(screen.getByLabelText("Тайтл"), "frontend");
     await user.selectOptions(screen.getByLabelText("Локация"), "armenia");
@@ -48,5 +50,16 @@ describe("JobFilters", () => {
     expect(screen.getByLabelText("Текущие фильтры")).toHaveTextContent(
       JSON.stringify(initial),
     );
+  });
+
+  it("closes an open multi-select after an outside click", async () => {
+    const user = userEvent.setup();
+    render(<Harness />);
+
+    await user.click(screen.getByRole("button", { name: "Любой стек" }));
+    expect(screen.getByRole("listbox", { name: "Стек" })).toBeInTheDocument();
+
+    await user.click(screen.getByLabelText("Тайтл"));
+    expect(screen.queryByRole("listbox", { name: "Стек" })).not.toBeInTheDocument();
   });
 });

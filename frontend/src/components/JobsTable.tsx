@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ExternalIcon } from "./Icons";
 import { formatDate } from "../lib/format";
 import { jobFormat } from "../lib/jobs";
 import type { Job, ResumeMatch, WorkFormat } from "../types";
+import { Pagination } from "./Pagination";
 
 const formatLabels: Record<WorkFormat, string> = {
   remote: "Удалённо",
@@ -15,6 +16,7 @@ interface Props { jobs: Job[]; pageSize?: number; newJobIds?: ReadonlySet<string
 
 export function JobsTable({ jobs, pageSize = 20, newJobIds, resumeMatches }: Props) {
   const [page, setPage] = useState(1);
+  const tableRef = useRef<HTMLElement>(null);
   const pages = Math.max(1, Math.ceil(jobs.length / pageSize));
   useEffect(() => setPage(1), [jobs]);
   const currentPage = Math.min(page, pages);
@@ -26,7 +28,7 @@ export function JobsTable({ jobs, pageSize = 20, newJobIds, resumeMatches }: Pro
   }
 
   return (
-    <section className="overflow-hidden rounded-xl border border-admin-border bg-white">
+    <section className="scroll-mt-4 overflow-hidden rounded-xl border border-admin-border bg-white" ref={tableRef}>
       <div className="overflow-x-auto">
         <table className="w-full min-w-[1050px] text-left text-sm">
           <thead className="border-b border-admin-border bg-admin-soft text-xs font-semibold uppercase tracking-wide text-admin-muted">
@@ -49,9 +51,9 @@ export function JobsTable({ jobs, pageSize = 20, newJobIds, resumeMatches }: Pro
           </tbody>
         </table>
       </div>
-      <footer className="flex items-center justify-between border-t border-admin-border px-4 py-3 text-sm text-admin-muted">
+      <footer className="flex flex-col gap-3 border-t border-admin-border px-4 py-3 text-sm text-admin-muted sm:flex-row sm:items-center sm:justify-between">
         <span>Показано {firstVisible + 1}–{firstVisible + visible.length} из {jobs.length}</span>
-        <div className="flex items-center gap-2"><button className="pager-button" disabled={currentPage === 1} onClick={() => setPage((value) => value - 1)}>Назад</button><span>{currentPage} / {pages}</span><button className="pager-button" disabled={currentPage === pages} onClick={() => setPage((value) => value + 1)}>Далее</button></div>
+        <Pagination page={currentPage} pages={pages} onChange={setPage} scrollTarget={tableRef} />
       </footer>
     </section>
   );

@@ -12,6 +12,7 @@ from job_finder.excel import (
     write_companies,
 )
 from job_finder.service import CrawlBusyError, CrawlService
+from job_finder.database import DatabaseStore
 from job_finder.settings import AppSettings, BACKEND_ROOT
 
 
@@ -77,8 +78,15 @@ def crawl(
     ),
     concurrency: int = typer.Option(8, min=1, max=50),
     per_domain: int = typer.Option(2, min=1, max=5),
-    request_timeout: float = typer.Option(15.0, min=1.0, max=120.0),
+    request_timeout: float = typer.Option(10.0, min=1.0, max=120.0),
     company_timeout: float = typer.Option(60.0, min=5.0, max=600.0),
+    browser_pool_wait: float = typer.Option(
+        30.0,
+        "--browser-pool-wait",
+        min=1.0,
+        max=120.0,
+        help="Maximum wait for a free Playwright page.",
+    ),
     retries: int = typer.Option(2, min=0, max=5),
     browser: bool = typer.Option(
         True, "--browser/--no-browser", help="Use Playwright as the final fallback."
@@ -89,18 +97,22 @@ def crawl(
         help="Honor robots.txt rules (enabled by default).",
     ),
 ) -> None:
-    """Crawl enabled companies and write latest plus timestamped JSON results."""
+    """Crawl enabled companies and commit the result to the configured database."""
     try:
         settings = CrawlSettings(
             concurrency=concurrency,
             per_domain=per_domain,
             request_timeout_seconds=request_timeout,
             company_timeout_seconds=company_timeout,
+            browser_pool_wait_seconds=browser_pool_wait,
             retries=retries,
             browser_enabled=browser,
             respect_robots=respect_robots,
         )
-        service = CrawlService(companies_path, output_directory)
+        database_url = DEFAULTS.database_url or f"sqlite:///{(output_directory.resolve() / 'job_finder.db').as_posix()}"
+        database = DatabaseStore(database_url)
+        database.bootstrap_legacy(companies_path, output_directory)
+        service = CrawlService(companies_path, output_directory, database=database)
         report = asyncio.run(service.run(settings))
         latest = output_directory / "latest.json"
         snapshot = output_directory / "runs" / f"{report.run_id}.json"
@@ -118,6 +130,7 @@ def crawl(
     typer.echo(
         f"Finished: {stats.jobs_found} jobs; "
         f"success={stats.success}, no_jobs={stats.no_jobs}, "
+        f"unsupported={stats.unsupported}, unverified={stats.unverified}, "
         f"blocked={stats.blocked}, failed={stats.failed}, skipped={stats.skipped}"
     )
     typer.echo(f"Latest: {latest}")
@@ -134,3 +147,29 @@ def serve(
     import uvicorn
 
     uvicorn.run("job_finder.api:app", host=host, port=port, reload=reload, workers=1)
+
+
+@app.command("db-upgrade")
+def db_upgrade() -> None:
+    """Apply all database schema migrations."""
+    from alembic import command
+    from alembic.config import Config
+
+    config = Config(str(BACKEND_ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_ROOT / "migrations"))
+    config.set_main_option("prepend_sys_path", str(BACKEND_ROOT / "src"))
+    config.set_main_option("sqlalchemy.url", DEFAULTS.resolved_database_url)
+    command.upgrade(config, "head")
+    typer.echo("Database schema is up to date.")
+
+
+@app.command("db-info")
+def db_info() -> None:
+    """Show the active local database and imported record counts."""
+    database = DatabaseStore(DEFAULTS.resolved_database_url)
+    database.bootstrap_legacy(DEFAULTS.companies_path, DEFAULTS.output_directory)
+    latest = database.read_latest()
+    typer.echo(f"Database: {DEFAULTS.resolved_database_url}")
+    typer.echo(f"Companies: {len(database.list_companies())}")
+    typer.echo(f"Latest run: {latest.run_id if latest else 'none'}")
+    typer.echo(f"Latest jobs: {len(latest.jobs) if latest else 0}")

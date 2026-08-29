@@ -5,7 +5,7 @@ from filelock import FileLock
 from openpyxl import Workbook
 import pytest
 
-from job_finder.company_import import CompanyImportBusyError, import_companies_xlsx
+from job_finder.company_import import CompanyImportBusyError, import_companies_xlsx, preview_companies_xlsx
 from job_finder.excel import REQUIRED_COLUMNS, load_companies, write_companies
 from job_finder.models import Company
 
@@ -61,6 +61,19 @@ def test_import_can_keep_duplicates_with_unique_technical_ids(tmp_path) -> None:
     companies = load_companies(companies_path)
     assert result.added == 1
     assert [company.id for company in companies] == ["acme", "acme-2"]
+
+
+def test_preview_reads_xlsx_in_memory_without_temporary_files(tmp_path) -> None:
+    companies_path = tmp_path / "data" / "companies.json"
+    write_companies(companies_path, [existing_company()])
+
+    result = preview_companies_xlsx(
+        workbook_bytes([("New Company", "https://new.example")]),
+        companies_path=companies_path,
+    )
+
+    assert result.would_add == 1
+    assert list(companies_path.parent.glob("tmp*.xlsx")) == []
 
 
 def test_reset_replaces_existing_companies_and_import_respects_crawl_lock(tmp_path) -> None:

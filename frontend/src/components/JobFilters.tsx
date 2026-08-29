@@ -1,4 +1,5 @@
 import type { JobFilters as Filters } from "../lib/jobs";
+import { MultiSelect } from "./MultiSelect";
 
 interface Props {
   filters: Filters;
@@ -27,24 +28,8 @@ export function JobFilters({ companies, filters, stacks, onChange, resumeAvailab
         Тайтл
         <input className={control} placeholder="Например, React Developer" value={filters.title} onChange={(e) => onChange({ ...filters, title: e.target.value })} />
       </label>
-      <div className="grid gap-1.5 text-xs font-medium text-admin-muted">
-        Стек
-        <details className="relative">
-          <summary className={`${control} flex list-none items-center justify-between`}><span className="truncate">{filters.stacks.length ? `Выбрано: ${filters.stacks.length}` : "Любой стек"}</span><span aria-hidden>⌄</span></summary>
-          <div className="absolute z-20 mt-1 max-h-64 w-full min-w-48 overflow-auto rounded-lg border border-admin-border bg-white p-2 shadow-lg">
-            {stacks.length ? stacks.map((stack) => <label className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-2 text-sm text-admin-ink hover:bg-admin-soft" key={stack}><input className="accent-admin-primary" type="checkbox" checked={filters.stacks.includes(stack)} onChange={() => toggleStack(stack)} />{stack}</label>) : <p className="p-2 text-sm font-normal text-admin-muted">Нет данных</p>}
-          </div>
-        </details>
-      </div>
-      <div className="grid gap-1.5 text-xs font-medium text-admin-muted">
-        Исключить компании
-        <details className="relative">
-          <summary className={`${control} flex list-none items-center justify-between`}><span className="truncate">{filters.excludedCompanies.length ? `Исключено: ${filters.excludedCompanies.length}` : "Не исключать"}</span><span aria-hidden>⌄</span></summary>
-          <div className="absolute z-20 mt-1 max-h-64 w-full min-w-56 overflow-auto rounded-lg border border-admin-border bg-white p-2 shadow-lg">
-            {companies.length ? companies.map((company) => <label className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-2 text-sm text-admin-ink hover:bg-admin-soft" key={company}><input className="accent-admin-primary" type="checkbox" checked={filters.excludedCompanies.includes(company)} onChange={() => toggleCompany(company)} />{company}</label>) : <p className="p-2 text-sm font-normal text-admin-muted">Нет данных</p>}
-          </div>
-        </details>
-      </div>
+      <MultiSelect label="Стек" options={stacks} selected={filters.stacks} emptyLabel="Любой стек" selectedLabel={(count) => `Выбрано: ${count}`} onToggle={toggleStack} controlClassName={control} />
+      <MultiSelect label="Исключить компании" options={companies} selected={filters.excludedCompanies} emptyLabel="Не исключать" selectedLabel={(count) => `Исключено: ${count}`} onToggle={toggleCompany} controlClassName={control} />
       <label className="grid gap-1.5 text-xs font-medium text-admin-muted">
         Локация
         <select className={control} value={filters.location} onChange={(e) => onChange({ ...filters, location: e.target.value as Filters["location"] })}>

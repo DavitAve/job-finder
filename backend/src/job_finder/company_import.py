@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import re
-import tempfile
 import unicodedata
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlsplit
 from zipfile import BadZipFile
@@ -39,6 +39,47 @@ class CompanyImportPreview(BaseModel):
     total_after_import: int
     replaced_existing: bool
     validation_errors: list[str] = Field(default_factory=list)
+
+
+def _read_uploaded_xlsx(content: bytes) -> list[Company]:
+    try:
+        return read_companies_from_xlsx(BytesIO(content))
+    except (BadZipFile, InvalidFileException) as exc:
+        raise ValueError("The uploaded file is not a valid XLSX workbook") from exc
+
+
+def read_uploaded_companies(content: bytes) -> list[Company]:
+    if not content:
+        raise ValueError("The uploaded XLSX file is empty")
+    if len(content) > MAX_XLSX_BYTES:
+        raise ValueError(f"The uploaded XLSX file exceeds {MAX_XLSX_BYTES // 1024 // 1024} MB")
+    companies = _read_uploaded_xlsx(content)
+    if not companies:
+        raise ValueError("The uploaded XLSX file contains no companies")
+    return companies
+
+
+def preview_company_import(
+    existing: list[Company],
+    uploaded: list[Company],
+    *,
+    reset_existing: bool = False,
+    deduplicate: bool = True,
+) -> CompanyImportPreview:
+    merged, added, skipped = merge_companies(
+        existing,
+        uploaded,
+        reset_existing=reset_existing,
+        deduplicate=deduplicate,
+    )
+    return CompanyImportPreview(
+        uploaded=len(uploaded),
+        would_add=added,
+        duplicates_found=skipped,
+        current_total=len(existing),
+        total_after_import=len(merged),
+        replaced_existing=reset_existing,
+    )
 
 
 def _name_key(value: str) -> str:
@@ -99,27 +140,8 @@ def import_companies_xlsx(
     reset_existing: bool = False,
     deduplicate: bool = True,
 ) -> CompanyImportResult:
-    if not content:
-        raise ValueError("The uploaded XLSX file is empty")
-    if len(content) > MAX_XLSX_BYTES:
-        raise ValueError(f"The uploaded XLSX file exceeds {MAX_XLSX_BYTES // 1024 // 1024} MB")
     companies_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            suffix=".xlsx", dir=companies_path.parent, delete=False
-        ) as temporary:
-            temporary.write(content)
-            temporary_path = Path(temporary.name)
-        try:
-            uploaded = read_companies_from_xlsx(temporary_path)
-        except (BadZipFile, InvalidFileException) as exc:
-            raise ValueError("The uploaded file is not a valid XLSX workbook") from exc
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-    if not uploaded:
-        raise ValueError("The uploaded XLSX file contains no companies")
+    uploaded = read_uploaded_companies(content)
 
     try:
         counts: dict[str, int] = {}
@@ -156,37 +178,9 @@ def preview_companies_xlsx(
     reset_existing: bool = False,
     deduplicate: bool = True,
 ) -> CompanyImportPreview:
-    if not content:
-        raise ValueError("The uploaded XLSX file is empty")
-    if len(content) > MAX_XLSX_BYTES:
-        raise ValueError(f"The uploaded XLSX file exceeds {MAX_XLSX_BYTES // 1024 // 1024} MB")
     companies_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".xlsx", dir=companies_path.parent, delete=False) as temporary:
-            temporary.write(content)
-            temporary_path = Path(temporary.name)
-        try:
-            uploaded = read_companies_from_xlsx(temporary_path)
-        except (BadZipFile, InvalidFileException) as exc:
-            raise ValueError("The uploaded file is not a valid XLSX workbook") from exc
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-    if not uploaded:
-        raise ValueError("The uploaded XLSX file contains no companies")
+    uploaded = read_uploaded_companies(content)
     existing = load_companies(companies_path) if companies_path.exists() else []
-    merged, added, skipped = merge_companies(
-        existing,
-        uploaded,
-        reset_existing=reset_existing,
-        deduplicate=deduplicate,
-    )
-    return CompanyImportPreview(
-        uploaded=len(uploaded),
-        would_add=added,
-        duplicates_found=skipped,
-        current_total=len(existing),
-        total_after_import=len(merged),
-        replaced_existing=reset_existing,
+    return preview_company_import(
+        existing, uploaded, reset_existing=reset_existing, deduplicate=deduplicate
     )

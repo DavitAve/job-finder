@@ -10,7 +10,7 @@ from job_finder.models import (
     Job,
     WorkFormat,
 )
-from job_finder.output import list_history, read_latest, read_run, write_report
+from job_finder.output import list_history, read_company_history, read_latest, read_run, write_report
 import job_finder.output as output_module
 
 
@@ -42,6 +42,32 @@ def test_storage_keeps_current_and_three_previous_runs(tmp_path) -> None:
     assert read_run(tmp_path, reports[0].run_id) is None
 
 
+def test_compact_company_history_keeps_five_actual_checks(tmp_path) -> None:
+    reports = [report(index) for index in range(6)]
+    for index, item in enumerate(reports):
+        item.processed_company_ids = ["acme"]
+        item.companies = [CompanyCrawlResult(
+            company_id="acme",
+            company="Acme",
+            careers_url="https://acme.example/jobs",
+            resolved_careers_url=f"https://jobs.example/acme/{index}",
+            status=CompanyStatus.SUCCESS if index % 2 else CompanyStatus.FAILED,
+            adapter="greenhouse" if index % 2 else "html",
+            matching_jobs=index,
+            error=None if index % 2 else "Temporary error",
+            duration_ms=100 + index,
+            last_crawled_at=item.finished_at,
+        )]
+        write_report(item, tmp_path)
+
+    history = read_company_history(tmp_path, "acme")
+
+    assert len(history) == 5
+    assert [entry["run_id"] for entry in history] == [item.run_id for item in reversed(reports[1:])]
+    assert history[0]["jobs_found"] == 5
+    assert history[-1]["jobs_found"] == 1
+
+
 def test_invalid_run_id_cannot_escape_runs_directory(tmp_path) -> None:
     assert read_run(tmp_path, "../latest") is None
 
@@ -64,6 +90,24 @@ def test_schema_v1_remote_job_is_upgraded_when_read(tmp_path) -> None:
     loaded = read_latest(tmp_path)
     assert loaded is not None
     assert loaded.jobs[0].work_format == WorkFormat.REMOTE
+
+
+def test_legacy_company_result_uses_report_finish_as_last_crawl_time(tmp_path) -> None:
+    legacy = report(1).model_dump(mode="json")
+    legacy["companies"] = [
+        CompanyCrawlResult(
+            company_id="acme",
+            company="Acme",
+            status=CompanyStatus.NO_JOBS,
+        ).model_dump(mode="json")
+    ]
+    legacy["companies"][0].pop("last_crawled_at")
+    (tmp_path / "latest.json").write_text(json.dumps(legacy), encoding="utf-8")
+
+    loaded = read_latest(tmp_path)
+
+    assert loaded is not None
+    assert loaded.companies[0].last_crawled_at == loaded.finished_at
 
 
 def test_failed_latest_commit_rolls_back_new_snapshot(tmp_path, monkeypatch) -> None:

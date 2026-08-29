@@ -75,14 +75,17 @@ class Job(BaseModel):
 class CompanyStatus(StrEnum):
     SUCCESS = "success"
     NO_JOBS = "no_jobs"
+    UNSUPPORTED = "unsupported"
     BLOCKED = "blocked"
     FAILED = "failed"
+    UNVERIFIED = "unverified"
     SKIPPED = "skipped"
 
 
 class CompanyCrawlResult(BaseModel):
     company_id: str
     company: str
+    website_url: str | None = None
     careers_url: str | None = None
     resolved_careers_url: str | None = None
     careers_url_discovered: bool = False
@@ -91,6 +94,7 @@ class CompanyCrawlResult(BaseModel):
     candidates_found: int = 0
     matching_jobs: int = 0
     duration_ms: int = 0
+    last_crawled_at: datetime | None = None
     error: str | None = None
     warnings: list[str] = Field(default_factory=list)
 
@@ -106,8 +110,10 @@ class CrawlStats(BaseModel):
     total_companies: int
     success: int = 0
     no_jobs: int = 0
+    unsupported: int = 0
     blocked: int = 0
     failed: int = 0
+    unverified: int = 0
     skipped: int = 0
     jobs_found: int = 0
     duplicates_removed: int = 0
