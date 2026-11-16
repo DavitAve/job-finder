@@ -10,6 +10,8 @@ def main():
     from job_finder.settings import AppSettings
 
     settings = AppSettings.from_env()
+    if os.environ.get('RENDER') and not settings.resolved_database_url.startswith('postgresql'):
+        raise RuntimeError('Render Free requires a persistent PostgreSQL DATABASE_URL; local SQLite is not durable.')
     settings.output_directory.mkdir(parents=True, exist_ok=True)
     settings.resumes_directory.mkdir(parents=True, exist_ok=True)
     settings.companies_path.parent.mkdir(parents=True, exist_ok=True)

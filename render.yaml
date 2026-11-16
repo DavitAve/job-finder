@@ -4,15 +4,19 @@ services:
     runtime: docker
     dockerfilePath: ./Dockerfile
     dockerContext: .
-    plan: standard
+    plan: free
     numInstances: 1
     healthCheckPath: /api/health
-    disk:
-      name: job-finder-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
+      - key: DATABASE_URL
+        sync: false
       - key: JOB_FINDER_ALLOWED_ORIGINS
         sync: false
       - key: JOB_FINDER_CONCURRENCY
         value: "2"
+      - key: JOB_FINDER_OUTPUT_DIR
+        value: /tmp/job-finder/output
+      - key: JOB_FINDER_RESUMES_DIR
+        value: /tmp/job-finder/resumes
+      - key: JOB_FINDER_COMPANIES_FILE
+        value: /tmp/job-finder/companies.json
