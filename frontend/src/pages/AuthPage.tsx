@@ -55,7 +55,7 @@ export function AuthPage({ onAuthenticated }: { onAuthenticated: (user: AuthUser
           <div className="mt-6">
             <h2 className="text-xl font-semibold text-admin-ink">{mode === "login" ? "Войти в аккаунт" : "Создать аккаунт"}</h2>
             <p className="mt-1 text-sm leading-5 text-admin-muted">
-              {mode === "login" ? "Ваши компании, вакансии и резюме останутся только на этом компьютере." : "Первый аккаунт автоматически получит ваши существующие локальные данные."}
+              {mode === "login" ? "Ваши компании, вакансии и резюме привязаны к вашему аккаунту." : "После регистрации можно добавлять свои компании и резюме."}
             </p>
           </div>
 

@@ -92,7 +92,7 @@ export function AccountPage() {
           </label>
           <button className="h-10 rounded-lg bg-admin-primary px-4 text-sm font-semibold text-white transition hover:bg-admin-primary-dark disabled:cursor-not-allowed disabled:opacity-50" disabled={!file || full || upload.isPending} onClick={() => upload.mutate()}>{upload.isPending ? "Загружаем…" : "Добавить резюме"}</button>
         </div>
-        <p className="mt-3 text-xs text-admin-muted">Файлы и извлечённый текст хранятся только локально. Сканированные PDF без текстового слоя пока не поддерживаются.</p>
+        <p className="mt-3 text-xs text-admin-muted">Файлы и извлечённый текст сохраняются в вашем аккаунте. Сканированные PDF без текстового слоя пока не поддерживаются.</p>
         {full && <p className="mt-3 text-sm font-medium text-admin-primary">Достигнут лимит — удалите одно резюме, чтобы добавить новое.</p>}
       </section>
 
