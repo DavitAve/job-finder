@@ -337,6 +337,8 @@ class CrawlManager:
                 prepared,
                 CrawlSettings(
                     concurrency=self.app_settings.concurrency,
+                    browser_enabled=self.app_settings.browser_enabled,
+                    browser_pages=self.app_settings.browser_pages,
                     browser_pool_wait_seconds=self.app_settings.browser_pool_wait_seconds,
                 ),
                 progress_callback=on_progress,

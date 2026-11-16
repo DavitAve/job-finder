@@ -4,6 +4,30 @@ from job_finder.database import DatabaseStore
 from job_finder.models import Company, CompanyCrawlResult, CompanyStatus, CrawlReport, CrawlStats
 
 
+def test_resume_pdf_survives_lost_cache_and_metadata_updates(tmp_path) -> None:
+    from sqlalchemy import select
+    from job_finder.database import ResumeRow
+
+    store = make_store(tmp_path)
+    directory = tmp_path / 'resumes'
+    directory.mkdir()
+    original = b'%PDF-1.4\noriginal resume bytes'
+    cached = directory / 'resume-a.pdf'
+    cached.write_bytes(original)
+    record = dict(id='resume-a', filename='cv.pdf', language='en',
+                  created_at=datetime.now(timezone.utc).isoformat(),
+                  size_bytes=len(original), page_count=1, skills=['React'], text='Frontend engineer')
+    store.replace_resumes([record], 'resume-a', directory)
+    cached.unlink()
+    restarted = DatabaseStore(store.database_url)
+    records, _ = restarted.read_resumes()
+    restarted.replace_resumes(records, None, directory)
+    with restarted.sessions() as session:
+        row = session.scalar(select(ResumeRow).where(ResumeRow.user_id == 'local'))
+        assert row.pdf_content == original
+        assert not row.is_active
+
+
 def make_store(tmp_path, *, user_id: str = "local") -> DatabaseStore:
     store = DatabaseStore(f"sqlite:///{(tmp_path / 'job_finder.db').as_posix()}", user_id=user_id)
     store.initialize()

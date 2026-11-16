@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from filelock import FileLock, Timeout as FileLockTimeout
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, delete, event, select, update
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, LargeBinary, String, Text, UniqueConstraint, create_engine, delete, event, select, update
 from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
@@ -157,6 +157,7 @@ class ResumeRow(Base):
     skills: Mapped[list[str]] = mapped_column(JSON, default=list)
     extracted_text: Mapped[str] = mapped_column(Text, default="")
     file_path: Mapped[str] = mapped_column(Text)
+    pdf_content: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
@@ -568,11 +569,19 @@ class DatabaseStore:
         records: list[dict[str, Any]],
         active_id: str | None,
         directory: Path,
+        pdf_contents: dict[str, bytes] | None = None,
     ) -> None:
         with self.sessions.begin() as session:
+            existing_files = dict(session.execute(
+                select(ResumeRow.resume_id, ResumeRow.pdf_content).where(ResumeRow.user_id == self.user_id)
+            ).all())
             session.execute(delete(ResumeRow).where(ResumeRow.user_id == self.user_id))
             for record in records:
                 resume_id = str(record["id"])
+                pdf_path = directory / f"{resume_id}.pdf"
+                content = (pdf_contents or {}).get(resume_id) or existing_files.get(resume_id)
+                if content is None and pdf_path.exists():
+                    content = pdf_path.read_bytes()
                 session.add(ResumeRow(
                     user_id=self.user_id,
                     resume_id=resume_id,
@@ -584,6 +593,7 @@ class DatabaseStore:
                     skills=list(record.get("skills") or []),
                     extracted_text=str(record.get("text") or ""),
                     file_path=str((directory / f"{resume_id}.pdf").resolve()),
+                    pdf_content=content,
                     is_active=resume_id == active_id,
                 ))
 

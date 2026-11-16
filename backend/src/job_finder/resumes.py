@@ -170,14 +170,14 @@ class ResumeStore:
         records, active_id = self.database.read_resumes()
         return [ResumeRecord.model_validate(item) for item in records], active_id
 
-    def _write(self, records: list[ResumeRecord], active_id: str | None) -> None:
+    def _write(self, records: list[ResumeRecord], active_id: str | None, pdf_contents: dict[str, bytes] | None = None) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
         payload = {
             "active_id": active_id,
             "resumes": [record.model_dump(mode="json") for record in records],
         }
         if self.database is not None:
-            self.database.replace_resumes(payload["resumes"], active_id, self.directory)
+            self.database.replace_resumes(payload["resumes"], active_id, self.directory, pdf_contents=pdf_contents)
         handle, temporary = tempfile.mkstemp(prefix="resumes-", suffix=".json.tmp", dir=self.directory)
         try:
             with os.fdopen(handle, "w", encoding="utf-8") as stream:
@@ -233,7 +233,7 @@ class ResumeStore:
                 pdf_path.write_bytes(content)
                 try:
                     records.append(record)
-                    self._write(records, active_id or resume_id)
+                    self._write(records, active_id or resume_id, pdf_contents={resume_id: content})
                 except BaseException:
                     pdf_path.unlink(missing_ok=True)
                     raise

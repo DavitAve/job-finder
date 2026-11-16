@@ -18,6 +18,8 @@ class AppSettings(BaseModel):
     session_days: int = Field(default=30, ge=1, le=365)
     secure_cookies: bool = False
     concurrency: int = Field(default=8, ge=1, le=50)
+    browser_enabled: bool = True
+    browser_pages: int = Field(default=2, ge=1, le=5)
     browser_pool_wait_seconds: float = Field(default=30.0, gt=0, le=120)
     refresh_after_hours: float = Field(default=24.0, ge=1, le=720)
     allowed_origins: list[str] = Field(
@@ -51,6 +53,8 @@ class AppSettings(BaseModel):
             secure_cookies=os.getenv("JOB_FINDER_SECURE_COOKIES", "0").casefold()
             in {"1", "true", "yes"},
             concurrency=int(os.getenv("JOB_FINDER_CONCURRENCY", "8")),
+            browser_enabled=os.getenv("JOB_FINDER_BROWSER_ENABLED", "1").casefold() not in {"0", "false", "no"},
+            browser_pages=int(os.getenv("JOB_FINDER_BROWSER_PAGES", "2")),
             browser_pool_wait_seconds=float(
                 os.getenv("JOB_FINDER_BROWSER_POOL_WAIT_SECONDS", "30")
             ),
