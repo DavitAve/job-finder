@@ -7,6 +7,12 @@ from pathlib import Path
 
 
 def main():
+    secret_file = Path('/etc/secrets/job-finder.env')
+    if secret_file.exists():
+        for line in secret_file.read_text(encoding='utf-8-sig').splitlines():
+            if line.strip() and not line.lstrip().startswith('#'):
+                key, value = line.split('=', 1)
+                os.environ.setdefault(key.strip(), value.strip())
     from job_finder.settings import AppSettings
 
     settings = AppSettings.from_env()
