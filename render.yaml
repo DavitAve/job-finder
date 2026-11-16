@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: job-finder-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: standard
+    numInstances: 1
+    healthCheckPath: /api/health
+    disk:
+      name: job-finder-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: JOB_FINDER_ALLOWED_ORIGINS
+        sync: false
+      - key: JOB_FINDER_CONCURRENCY
+        value: "2"

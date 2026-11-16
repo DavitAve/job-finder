@@ -4,12 +4,14 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronLeftIcon, ChevronRightIcon, CloseIcon, CompaniesIcon, CoverageIcon, HistoryIcon, LogoutIcon, MenuIcon, SearchIcon, UserIcon } from "./Icons";
 import { api } from "../lib/api";
 
+const showExtraNavigation = import.meta.env.VITE_SHOW_EXTRA_NAVIGATION === "true";
+
 const navigation = [
-  { to: "/", label: "Текущий поиск", icon: SearchIcon, end: true },
-  { to: "/companies", label: "Компании", icon: CompaniesIcon },
-  { to: "/coverage", label: "Покрытие", icon: CoverageIcon },
-  { to: "/history", label: "История", icon: HistoryIcon },
-  { to: "/account", label: "Аккаунт", icon: UserIcon },
+  { to: "/", label: "Текущий поиск", icon: SearchIcon, end: true, visible: true },
+  { to: "/companies", label: "Компании", icon: CompaniesIcon, visible: true },
+  { to: "/coverage", label: "Покрытие", icon: CoverageIcon, visible: showExtraNavigation },
+  { to: "/history", label: "История", icon: HistoryIcon, visible: showExtraNavigation },
+  { to: "/account", label: "Аккаунт", icon: UserIcon, visible: showExtraNavigation },
 ] as const;
 
 export function AppShell() {
@@ -62,11 +64,12 @@ export function AppShell() {
           <button aria-label="Закрыть боковое меню" className="grid size-9 shrink-0 place-items-center rounded-lg text-white/65 hover:bg-white/10 hover:text-white lg:hidden" onClick={() => setMobileOpen(false)} type="button"><CloseIcon className="size-5" /></button>
         </div>
         <nav className="mt-7 flex min-w-0 flex-col gap-2" aria-label="Основная навигация">
-          {navigation.map(({ to, label, icon: Icon, ...item }) => (
+          {navigation.map(({ to, label, icon: Icon, visible, ...item }) => (
             <NavLink
               className={({ isActive }) => `flex min-w-0 items-center rounded-lg py-2.5 text-sm font-medium transition ${collapsed ? "gap-3 px-3 lg:justify-center lg:px-0" : "gap-3 px-3"} ${isActive ? "bg-admin-primary text-white" : "text-white/65 hover:bg-white/8 hover:text-white"}`}
               end={"end" in item ? item.end : undefined}
               key={to}
+              style={visible ? undefined : { display: "none" }}
               title={collapsed ? label : undefined}
               to={to}
             >
